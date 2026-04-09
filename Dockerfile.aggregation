@@ -1,0 +1,43 @@
+# WiFi/MAP Aggregation Server — Docker image
+# Central hub for MSP multi-site deployments.
+# Pi scanners at client sites dial OUT to this server via Tailscale.
+# The MSP dashboard connects here and gets pushed site status updates.
+# Proxies full scanner WebSocket when operator drills into a site.
+#
+# Build:
+#   docker build -f Dockerfile.aggregation -t wifimap-aggregation .
+#
+# Run via docker-compose (recommended):
+#   docker-compose up
+
+FROM python:3.11-slim
+
+LABEL org.opencontainers.image.title="WiFi/MAP Aggregation Server"
+LABEL org.opencontainers.image.version="5.3"
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    "websockets==12.0"
+
+COPY bin/aggregation_server.py .
+
+# Data directory for site registry SQLite database
+RUN mkdir -p /var/lib/wifimap
+VOLUME ["/var/lib/wifimap"]
+
+ENV AGG_HOST=0.0.0.0
+ENV AGG_SCANNER_PORT=8766
+ENV AGG_DASHBOARD_PORT=8767
+ENV AGG_DB_PATH=/var/lib/wifimap/aggregation.db
+
+EXPOSE 8766 8767
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python3 -c "import socket; s=socket.create_connection(('localhost',8767),2); s.close()" || exit 1
+
+CMD ["sh", "-c", "python3 aggregation_server.py \
+  --host ${AGG_HOST} \
+  --scanner-port ${AGG_SCANNER_PORT} \
+  --dashboard-port ${AGG_DASHBOARD_PORT} \
+  --db-path ${AGG_DB_PATH}"]

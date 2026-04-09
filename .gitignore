@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+coverage.xml
+.coverage
+
+# Credentials and environment — never commit these
+.env
+config.env
+*.env
+
+# Data files — stay on the device, not in the repo
+*.db
+*.sqlite
+zones.json
+
+# Logs
+*.log
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.tar.gz
+*.zip

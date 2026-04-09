@@ -1,0 +1,114 @@
+name: WiFi/MAP CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install \
+            "websockets==12.0" \
+            "requests==2.31.0" \
+            pytest \
+            pytest-asyncio \
+            pytest-cov
+
+      - name: Verify syntax
+        run: |
+          python3 -m py_compile bin/wifi_scanner.py
+          python3 -m py_compile bin/notification_server.py
+          python3 -m py_compile bin/aggregation_server.py
+          python3 -m py_compile bin/generate_report.py
+          echo "All files compile cleanly"
+
+      - name: Run tests
+        run: |
+          cd tests
+          python3 -m pytest test_scanner.py test_aggregation.py \
+            -v \
+            --tb=short \
+            -W error::DeprecationWarning \
+            --asyncio-mode=auto \
+            --cov=../bin/wifi_scanner --cov=../bin/aggregation_server \
+            --cov-report=term-missing \
+            --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          file: tests/coverage.xml
+          fail_ci_if_error: false
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pyflakes
+        run: pip install pyflakes
+
+      - name: Check for obvious errors
+        run: |
+          python3 -m pyflakes bin/wifi_scanner.py       || true
+          python3 -m pyflakes bin/notification_server.py || true
+          python3 -m pyflakes bin/aggregation_server.py  || true
+          python3 -m pyflakes bin/generate_report.py     || true
+
+  package:
+    name: Build Package
+    runs-on: ubuntu-latest
+    needs: [ test, lint ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build install package
+        run: |
+          chmod +x install.sh
+          tar -czf wifimap-v5.3.tar.gz \
+            install.sh \
+            README.md \
+            requirements.txt \
+            docker-compose.yml \
+            .env.example \
+            Dockerfile.dashboard \
+            Dockerfile.notify \
+            Dockerfile.aggregation \
+            bin/ \
+            web/ \
+            config/ \
+            tests/
+          echo "Package size: $(du -sh wifimap-v5.3.tar.gz | cut -f1)"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wifimap-v5.3
+          path: wifimap-v5.3.tar.gz
+          retention-days: 30

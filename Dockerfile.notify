@@ -1,0 +1,47 @@
+# WiFi/MAP Notification Server — Docker image
+# Bridges scanner security events to Ntfy push notifications.
+# Listens on port 8766 for events POSTed by the browser,
+# and connects to the scanner WebSocket to receive server-side events.
+#
+# Build:
+#   docker build -f Dockerfile.notify -t wifimap-notify .
+#
+# Run via docker-compose (recommended):
+#   docker-compose up
+
+FROM python:3.11-slim
+
+LABEL org.opencontainers.image.title="WiFi/MAP Notification Server"
+LABEL org.opencontainers.image.version="5.3"
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    "websockets==12.0" \
+    "requests==2.31.0"
+
+# Copy notification server
+COPY bin/notification_server.py .
+
+# Default environment — override in docker-compose.yml or at runtime
+ENV NTFY_HOST=localhost
+ENV NTFY_PORT=7777
+ENV NTFY_TOPIC=wifimap-alerts
+ENV BRIDGE_PORT=8766
+ENV SCANNER_WS=ws://localhost:8765
+ENV DASHBOARD_URL=
+
+EXPOSE 8766
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8766/health')" || exit 1
+
+CMD ["sh", "-c", "python3 notification_server.py \
+  --ntfy-host ${NTFY_HOST} \
+  --ntfy-port ${NTFY_PORT} \
+  --ntfy-topic ${NTFY_TOPIC} \
+  --bridge-port ${BRIDGE_PORT} \
+  --scanner-ws ${SCANNER_WS} \
+  ${DASHBOARD_URL:+--dashboard-url ${DASHBOARD_URL}}"]

@@ -1,0 +1,2529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WiFi/MAP Security</title>
+<!--
+  WiFi/MAP v5.3 — Security Platform
+  ===================================
+  Single-file dashboard. No build step required.
+
+  ARCHITECTURE
+  - 16 IIFE modules, single State object, EventBus pub/sub
+  - PersistModule: full localStorage persistence, schema versioned
+  - WSModule: single-site direct connection or MSP proxy via aggregation server
+  - SiteRegistry: MSP multi-site overview, real-time push from aggregation server
+  - CanvasModule: IDW heatmap, trilateration, drag-to-place Pi nodes, dirty-flag rAF
+
+  SECURITY
+  - SHA-256 WebSocket authentication, sessionStorage token
+  - All user data via safeText()/safeNode() — no innerHTML with external data
+  - WS protocol versioning (WS_VERSION=1), mismatch banner
+  - DOMPurify removed: DOM construction is inherently safe
+
+  PERSISTENCE (browser)
+  - Floor plan, zones, Pi node positions, approvals, Ntfy config, display prefs
+  - Zone authority on Pi (zones.json), event log replayed on reconnect
+  - Schema version: STORAGE_VERSION=1 (bump on breaking State changes)
+
+  MSP MULTI-SITE
+  - SiteRegistry connects to aggregation server (ws://tailscale-ip:8767)
+  - Real-time site_status push — no polling
+  - drill_in/drill_out: existing dashboard proxied through aggregation server
+  - Single-site mode fully preserved when no aggregation URL is configured
+-->
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0c10;--surface:#13161d;--surface2:#1c2030;--surface3:#222740;
+  --border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.13);
+  --text:#e8eaf0;--text2:#8b90a0;--text3:#555b6e;
+  --accent:#00e5a0;--accent2:#0077ff;--warn:#ff6b35;--danger:#ff2040;
+  --online:#00e5a0;--offline:#555b6e;--pihole:#cc2222;
+  --critical:#ff2040;--warning:#ff6b35;--info:#0077ff;
+  --mono:'Space Mono',monospace;--sans:'DM Sans',sans-serif;--radius:10px;
+}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+
+/* ── Auth overlay ── */
+#authOverlay{position:fixed;inset:0;background:rgba(10,12,16,.97);display:flex;align-items:center;justify-content:center;z-index:9999;backdrop-filter:blur(8px)}
+.auth-box{background:var(--surface);border:1px solid var(--border2);border-radius:14px;padding:32px 36px;width:320px;display:flex;flex-direction:column;gap:16px}
+.auth-logo{font-family:var(--mono);font-size:18px;color:var(--accent);letter-spacing:.12em;text-align:center}
+.auth-logo span{color:var(--text3)}
+.auth-subtitle{font-size:12px;color:var(--text3);text-align:center;font-family:var(--mono)}
+.auth-field{display:flex;flex-direction:column;gap:5px}
+.auth-label{font-size:10px;color:var(--text3);font-family:var(--mono);letter-spacing:.08em}
+.auth-input{background:var(--bg);border:1px solid var(--border2);border-radius:7px;padding:9px 12px;color:var(--text);font-family:var(--mono);font-size:12px;outline:none;transition:border-color .15s;width:100%}
+.auth-input:focus{border-color:rgba(0,229,160,.5)}
+.auth-btn{width:100%;padding:10px;background:var(--accent);color:#000;font-family:var(--sans);font-size:13px;font-weight:500;border:none;border-radius:var(--radius);cursor:pointer;transition:opacity .15s;margin-top:4px}
+.auth-btn:hover{opacity:.85}
+.auth-error{font-size:11px;color:var(--critical);font-family:var(--mono);text-align:center;display:none;padding:6px;background:rgba(255,32,64,.08);border-radius:5px}
+.auth-error.visible{display:block}
+.auth-version{font-size:9px;color:var(--text3);text-align:center;font-family:var(--mono)}
+
+/* ── Banners ── */
+#renderErrorBanner{display:none;background:rgba(255,107,53,.12);border-bottom:1px solid rgba(255,107,53,.3);padding:5px 16px;font-family:var(--mono);font-size:10px;color:var(--warn);text-align:center;flex-shrink:0}
+#renderErrorBanner.visible{display:block}
+#versionBanner{display:none;background:rgba(255,107,53,.12);border-bottom:1px solid rgba(255,107,53,.3);padding:6px 16px;font-family:var(--mono);font-size:10px;color:var(--warn);text-align:center;flex-shrink:0}
+#versionBanner.visible{display:block}
+#persistBanner{display:none;background:rgba(0,229,160,.08);border-bottom:1px solid rgba(0,229,160,.2);padding:5px 16px;font-family:var(--mono);font-size:10px;color:var(--accent);text-align:center;flex-shrink:0;cursor:pointer}
+#persistBanner.visible{display:flex;align-items:center;justify-content:center;gap:12px}
+
+/* ── Header ── */
+header{display:flex;align-items:center;justify-content:space-between;padding:0 16px;height:44px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0;gap:12px}
+.logo{font-family:var(--mono);font-size:12px;color:var(--accent);letter-spacing:.1em;white-space:nowrap}
+.logo span{color:var(--text3)}
+.hdr-pills{display:flex;align-items:center;gap:8px;flex:1;overflow:hidden}
+.hdr-pill{display:flex;align-items:center;gap:5px;background:var(--surface2);border:1px solid var(--border2);border-radius:4px;padding:2px 8px;font-size:9px;font-family:var(--mono);white-space:nowrap}
+.pill-dot{width:5px;height:5px;border-radius:50%;background:var(--text3);flex-shrink:0}
+.pill-dot.on{background:var(--accent);box-shadow:0 0 4px var(--accent)}
+.pill-dot.err{background:var(--warn)}
+.pill-dot.ph{background:var(--pihole);box-shadow:0 0 4px var(--pihole)}
+.pill-dot.auth{background:#ffd700;box-shadow:0 0 4px #ffd700}
+.pill-dot.saved{background:var(--accent)}
+.alert-badge{background:var(--critical);color:#fff;border-radius:3px;padding:1px 5px;font-size:9px;font-family:var(--mono);font-weight:700;display:none}
+.alert-badge.visible{display:inline}
+.hdr-logout{background:none;border:1px solid var(--border2);border-radius:4px;color:var(--text3);font-size:9px;font-family:var(--mono);cursor:pointer;padding:2px 8px;transition:all .15s}
+.hdr-logout:hover{color:var(--warn);border-color:rgba(255,107,53,.3)}
+
+/* ── Tab Bar ── */
+.floor-bar{display:flex;align-items:stretch;height:36px;background:var(--bg);border-bottom:1px solid var(--border);padding:0 12px;gap:1px;flex-shrink:0;overflow-x:auto}
+.floor-tab{display:flex;align-items:center;gap:6px;padding:0 12px;background:transparent;border:none;border-bottom:2px solid transparent;color:var(--text3);font-family:var(--mono);font-size:10px;cursor:pointer;white-space:nowrap;transition:all .15s;margin-bottom:-1px}
+.floor-tab:hover{color:var(--text2);background:rgba(255,255,255,.02)}
+.floor-tab.active{color:var(--accent);border-bottom-color:var(--accent);background:rgba(0,229,160,.04)}
+.tab-del{opacity:0;font-size:13px;color:var(--text3);background:none;border:none;cursor:pointer;padding:0 1px;transition:all .15s}
+.floor-tab:hover .tab-del{opacity:1}
+.tab-del:hover{color:var(--warn)!important}
+.floor-badge{font-size:8px;background:var(--surface2);color:var(--text3);border-radius:3px;padding:1px 4px}
+.floor-tab.active .floor-badge{background:rgba(0,229,160,.12);color:var(--accent)}
+.floor-glyph{font-size:8px;color:var(--text3);opacity:.6}
+.floor-add{display:flex;align-items:center;padding:0 10px;background:none;border:none;color:var(--text3);font-size:18px;cursor:pointer;transition:color .15s}
+.floor-add:hover{color:var(--accent)}
+
+/* ── Main layout ── */
+.main{flex:1;display:grid;grid-template-columns:200px 1fr 200px 210px 220px;overflow:hidden}
+.panel{background:var(--surface);border-right:1px solid var(--border);overflow-y:auto;padding:11px;display:flex;flex-direction:column;gap:11px}
+.panel-right{background:var(--surface);border-left:1px solid var(--border);overflow-y:auto;padding:11px;display:flex;flex-direction:column;gap:11px}
+.canvas-area{position:relative;background:var(--bg);overflow:hidden}
+#floorCanvas{display:block;cursor:crosshair}
+
+/* ── Atoms ── */
+.section-label{font-family:var(--mono);font-size:9px;letter-spacing:.14em;color:var(--text3);text-transform:uppercase;padding-bottom:6px;border-bottom:1px solid var(--border);margin-bottom:2px}
+.tool-btn{display:flex;align-items:center;gap:7px;width:100%;padding:6px 9px;background:transparent;border:1px solid var(--border);border-radius:7px;color:var(--text2);font-family:var(--sans);font-size:12px;cursor:pointer;margin-bottom:3px;transition:all .15s}
+.tool-btn:hover{background:var(--surface2);color:var(--text);border-color:var(--border2)}
+.tool-btn.active{background:rgba(0,229,160,.08);color:var(--accent);border-color:rgba(0,229,160,.28)}
+.tool-btn.zone-tool.active{background:rgba(255,32,64,.08);color:var(--critical);border-color:rgba(255,32,64,.4)}
+.tool-btn.zone-tool{border-color:rgba(255,32,64,.2)}
+.tool-icon{width:14px;font-size:11px;text-align:center;flex-shrink:0}
+.field-label{font-size:10px;color:var(--text3);margin-bottom:3px;font-family:var(--mono)}
+.field-row{margin-bottom:6px}
+.field-input{width:100%;background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:5px 8px;color:var(--text);font-family:var(--mono);font-size:11px;outline:none;transition:border-color .15s}
+.field-input:focus{border-color:rgba(0,229,160,.4)}
+.select-input{width:100%;background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:5px 8px;color:var(--text);font-family:var(--mono);font-size:11px;outline:none;appearance:none}
+.primary-btn{width:100%;padding:7px;background:var(--accent);color:#000;font-family:var(--sans);font-size:12px;font-weight:500;border:none;border-radius:var(--radius);cursor:pointer;transition:opacity .15s}
+.primary-btn:hover{opacity:.85}
+.secondary-btn{width:100%;padding:7px;background:transparent;color:var(--text2);font-family:var(--sans);font-size:12px;border:1px solid var(--border2);border-radius:var(--radius);cursor:pointer;transition:all .15s;margin-top:4px}
+.secondary-btn:hover{background:var(--surface2);color:var(--text)}
+.opacity-row{display:flex;align-items:center;gap:8px}
+.opacity-row input[type=range]{flex:1;accent-color:var(--accent)}
+.opacity-val{font-family:var(--mono);font-size:10px;color:var(--text2);min-width:26px}
+.mini-toggle{width:28px;height:15px;border-radius:8px;background:var(--border2);border:none;cursor:pointer;position:relative;transition:background .2s;flex-shrink:0}
+.mini-toggle::after{content:'';position:absolute;width:11px;height:11px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all .2s}
+.mini-toggle.on{background:rgba(0,229,160,.28)}
+.mini-toggle.on::after{background:var(--accent);left:15px}
+
+/* ── Zone styles ── */
+.zone-card{background:var(--surface2);border-radius:7px;padding:8px 10px;margin-bottom:5px;border:1px solid var(--border);cursor:pointer;transition:border-color .15s}
+.zone-card:hover{border-color:var(--border2)}
+.zone-card.selected{border-color:rgba(255,107,53,.4)}
+.zone-top{display:flex;align-items:center;gap:7px;margin-bottom:4px}
+.zone-color-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.zone-name{font-size:11px;font-weight:500;color:var(--text);flex:1}
+.zone-type-badge{font-size:8px;font-family:var(--mono);padding:1px 5px;border-radius:3px}
+.zone-type-badge.restricted{background:rgba(255,32,64,.15);color:var(--critical)}
+.zone-type-badge.monitored{background:rgba(255,107,53,.15);color:var(--warn)}
+.zone-type-badge.safe{background:rgba(0,229,160,.15);color:var(--accent)}
+.zone-type-badge.perimeter{background:rgba(140,100,255,.15);color:#8c64ff}
+.zone-meta{font-family:var(--mono);font-size:9px;color:var(--text3)}
+.zone-actions{display:flex;gap:4px;margin-top:6px}
+.zone-btn{flex:1;padding:3px;background:transparent;border:1px solid var(--border2);border-radius:4px;color:var(--text3);font-size:9px;font-family:var(--mono);cursor:pointer;transition:all .15s;text-align:center}
+.zone-btn:hover{background:var(--surface3);color:var(--text2)}
+
+/* ── Alert panel ── */
+.alert-item{display:flex;flex-direction:column;gap:3px;padding:8px 10px;border-radius:7px;background:var(--surface2);margin-bottom:5px;border-left:3px solid transparent;animation:slideIn .2s ease;position:relative}
+.alert-item.critical{border-left-color:var(--critical);background:rgba(255,32,64,.05)}
+.alert-item.warning{border-left-color:var(--warn);background:rgba(255,107,53,.04)}
+.alert-item.info{border-left-color:var(--info);background:rgba(0,119,255,.04)}
+@keyframes slideIn{from{opacity:0;transform:translateX(-6px)}to{opacity:1;transform:none}}
+.alert-header{display:flex;align-items:center;gap:6px}
+.alert-sev{font-family:var(--mono);font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px}
+.alert-sev.critical{background:rgba(255,32,64,.2);color:var(--critical)}
+.alert-sev.warning{background:rgba(255,107,53,.15);color:var(--warn)}
+.alert-sev.info{background:rgba(0,119,255,.12);color:var(--info)}
+.alert-title{font-size:11px;font-weight:500;color:var(--text);flex:1}
+.alert-time{font-family:var(--mono);font-size:9px;color:var(--text3)}
+.alert-body{font-size:10px;color:var(--text2);line-height:1.45}
+.alert-meta{font-family:var(--mono);font-size:9px;color:var(--text3)}
+.alert-actions{display:flex;gap:4px;margin-top:4px}
+.alert-btn{padding:2px 7px;background:transparent;border:1px solid var(--border2);border-radius:4px;color:var(--text3);font-size:9px;font-family:var(--mono);cursor:pointer;transition:all .15s}
+.alert-btn:hover{background:var(--surface3);color:var(--text2)}
+.alert-dismiss{position:absolute;top:6px;right:8px;background:none;border:none;color:var(--text3);font-size:13px;cursor:pointer;line-height:1;padding:0;transition:color .15s}
+.alert-dismiss:hover{color:var(--text2)}
+
+/* ── Event log ── */
+.log-item{display:flex;gap:8px;padding:5px 7px;border-radius:5px;margin-bottom:3px;font-size:9px;font-family:var(--mono);align-items:flex-start}
+.log-item:nth-child(even){background:var(--surface2)}
+.log-sev-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:2px}
+.log-sev-dot.critical{background:var(--critical)}
+.log-sev-dot.warning{background:var(--warn)}
+.log-sev-dot.info{background:var(--info)}
+.log-time{color:var(--text3);white-space:nowrap;flex-shrink:0}
+.log-msg{color:var(--text2);flex:1;line-height:1.4}
+
+/* ── Anomaly scores ── */
+.anomaly-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;background:var(--surface2);margin-bottom:4px}
+.anomaly-bar-wrap{flex:1;height:4px;background:var(--surface3);border-radius:2px;overflow:hidden}
+.anomaly-bar{height:100%;border-radius:2px;transition:width .5s ease}
+.anomaly-score-val{font-family:var(--mono);font-size:10px;min-width:28px;text-align:right}
+.anomaly-name{font-size:10px;color:var(--text2);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ── Notify config ── */
+.notify-section{background:var(--surface2);border-radius:var(--radius);padding:10px;margin-bottom:8px}
+.tier-row{display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:11px}
+.tier-label-crit{color:var(--critical);font-weight:500}
+.tier-label-warn{color:var(--warn);font-weight:500}
+.tier-label-info{color:var(--info);font-weight:500}
+
+/* ── MSP Overview overlay ── */
+#mspOverlay{display:none;position:fixed;inset:0;background:var(--bg);z-index:100;flex-direction:column;overflow:hidden}
+#mspOverlay.visible{display:flex}
+.msp-header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
+.msp-logo{font-family:var(--mono);font-size:13px;color:var(--accent);letter-spacing:.1em}
+.msp-logo span{color:var(--text3)}
+.msp-hdr-right{display:flex;align-items:center;gap:10px}
+.msp-pill{display:flex;align-items:center;gap:5px;background:var(--surface2);border:1px solid var(--border2);border-radius:4px;padding:2px 8px;font-size:9px;font-family:var(--mono)}
+.msp-back-btn{background:none;border:1px solid var(--border2);border-radius:4px;color:var(--text2);font-family:var(--mono);font-size:10px;padding:4px 10px;cursor:pointer;transition:all .15s}
+.msp-back-btn:hover{color:var(--accent);border-color:rgba(0,229,160,.3)}
+.msp-body{flex:1;overflow-y:auto;padding:20px}
+.msp-section-label{font-family:var(--mono);font-size:9px;letter-spacing:.14em;color:var(--text3);text-transform:uppercase;margin-bottom:12px}
+.msp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-bottom:24px}
+.site-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px;cursor:pointer;transition:all .18s;position:relative}
+.site-card:hover{border-color:var(--border2);background:var(--surface2);transform:translateY(-1px)}
+.site-card.online{border-left:3px solid var(--accent)}
+.site-card.offline{border-left:3px solid var(--text3);opacity:.65}
+.site-card.alert{border-left:3px solid var(--critical);animation:cardPulse 2s ease-in-out infinite}
+@keyframes cardPulse{0%,100%{box-shadow:none}50%{box-shadow:0 0 12px rgba(255,32,64,.2)}}
+.site-card-top{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.site-status-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.site-status-dot.online{background:var(--accent);box-shadow:0 0 5px var(--accent)}
+.site-status-dot.offline{background:var(--text3)}
+.site-status-dot.alert{background:var(--critical);box-shadow:0 0 5px var(--critical)}
+.site-name{font-size:12px;font-weight:500;color:var(--text);flex:1}
+.site-drill-arrow{color:var(--text3);font-size:14px;transition:color .15s}
+.site-card:hover .site-drill-arrow{color:var(--accent)}
+.site-stats{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px}
+.site-stat{background:var(--surface2);border-radius:5px;padding:5px 8px;text-align:center}
+.site-stat-val{font-family:var(--mono);font-size:14px;font-weight:700;color:var(--text)}
+.site-stat-val.has-alerts{color:var(--critical)}
+.site-stat-val.has-devices{color:var(--accent)}
+.site-stat-label{font-family:var(--mono);font-size:8px;color:var(--text3);margin-top:1px}
+.site-last-event{font-size:9px;font-family:var(--mono);color:var(--text3);border-top:1px solid var(--border);padding-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.site-last-event.critical{color:var(--critical)}
+.site-last-event.warning{color:var(--warn)}
+.msp-empty{text-align:center;padding:60px 20px;color:var(--text3);font-family:var(--mono);font-size:12px}
+.msp-empty-icon{font-size:32px;margin-bottom:12px;opacity:.4}
+.msp-drilling{position:absolute;inset:0;background:rgba(10,12,16,.7);border-radius:10px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:var(--accent)}
+.agg-config{background:var(--surface2);border-radius:var(--radius);padding:9px;margin-bottom:8px}
+
+/* ── Ghost controls ── */
+.ghost-row{display:flex;align-items:center;justify-content:space-between;padding:5px 8px;background:var(--surface2);border-radius:6px;font-family:var(--mono);font-size:10px;margin-bottom:4px}
+.ghost-row-left{display:flex;align-items:center;gap:6px}
+
+/* ── Device cards ── */
+.device-card{background:var(--surface2);border-radius:7px;padding:8px 9px;margin-bottom:4px;border:1px solid transparent;transition:border-color .2s;cursor:pointer}
+.device-card:hover{border-color:var(--border2)}
+.device-card.selected{border-color:rgba(0,229,160,.35);background:rgba(0,229,160,.04)}
+.device-card.offline{opacity:.5}
+.device-card.flagged{border-color:rgba(255,32,64,.35);background:rgba(255,32,64,.04)}
+.dc-top{display:flex;align-items:center;gap:7px;margin-bottom:4px}
+.dc-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.dc-dot.online{background:var(--online);box-shadow:0 0 4px var(--online)}
+.dc-dot.offline{background:var(--offline)}
+.dc-name{font-size:11px;font-weight:500;color:var(--text);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dc-latency{font-family:var(--mono);font-size:9px;padding:1px 4px;border-radius:3px}
+.dc-latency.good{background:rgba(0,229,160,.12);color:var(--accent)}
+.dc-latency.ok{background:rgba(255,215,0,.1);color:#ffd700}
+.dc-latency.bad{background:rgba(255,107,53,.1);color:var(--warn)}
+.dc-latency.offline{background:var(--surface3);color:var(--text3)}
+.dc-meta{font-family:var(--mono);font-size:9px;color:var(--text3);display:flex;flex-direction:column;gap:1px}
+.dc-ip{color:var(--text2)}
+.dc-ph{color:var(--pihole);font-size:8px}
+.dc-actions{display:flex;gap:4px;margin-top:6px}
+.dc-btn{flex:1;padding:3px;background:transparent;border:1px solid var(--border2);border-radius:4px;color:var(--text3);font-size:9px;font-family:var(--mono);cursor:pointer;transition:all .15s;text-align:center}
+.dc-btn:hover{background:var(--surface3);color:var(--text2)}
+.floor-pill{font-size:8px;background:var(--surface3);color:var(--text3);border-radius:3px;padding:1px 4px;font-family:var(--mono)}
+.filter-bar{display:flex;gap:3px;margin-bottom:4px}
+.filter-btn{flex:1;padding:3px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--text3);font-size:9px;font-family:var(--mono);cursor:pointer;transition:all .15s;text-align:center}
+.filter-btn:hover{color:var(--text2);border-color:var(--border2)}
+.filter-btn.active{background:rgba(0,229,160,.08);color:var(--accent);border-color:rgba(0,229,160,.25)}
+.dev-counts{display:flex;gap:6px;margin-bottom:7px}
+.dev-count{background:var(--surface2);border-radius:5px;padding:4px 7px;flex:1;text-align:center}
+.dev-count-val{font-family:var(--mono);font-size:13px;font-weight:700}
+.dev-count-val.green{color:var(--accent)}
+.dev-count-val.gray{color:var(--text3)}
+.dev-count-val.red{color:var(--critical)}
+.dev-count-label{font-family:var(--mono);font-size:8px;color:var(--text3);margin-top:1px}
+
+/* ── Stats ── */
+.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.stat-card{background:var(--surface2);border-radius:6px;padding:6px 8px}
+.stat-label{font-family:var(--mono);font-size:8px;letter-spacing:.1em;color:var(--text3);text-transform:uppercase;margin-bottom:2px}
+.stat-value{font-family:var(--mono);font-size:14px;font-weight:700}
+.stat-value.green{color:var(--accent)}
+.stat-value.blue{color:var(--accent2)}
+.stat-value.orange{color:var(--warn)}
+
+/* ── Pi node cards ── */
+.pi-node-card{background:var(--surface2);border-radius:6px;padding:7px 9px;margin-bottom:4px;border:1px solid var(--border);display:flex;align-items:center;gap:7px}
+.pi-node-card.active-node{border-color:rgba(0,229,160,.25)}
+.pi-node-card.unplaced{border-color:rgba(255,107,53,.3);background:rgba(255,107,53,.04)}
+.pi-node-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.pi-node-dot.online{background:var(--accent);box-shadow:0 0 4px var(--accent)}
+.pi-node-dot.offline{background:var(--offline)}
+.pi-node-info{flex:1;min-width:0}
+.pi-node-label{font-family:var(--mono);font-size:10px;color:var(--text)}
+.pi-node-meta{font-family:var(--mono);font-size:8px;color:var(--text3);margin-top:1px}
+.pi-place-hint{font-size:9px;color:var(--warn);font-family:var(--mono);margin-top:2px}
+
+/* ── Readings ── */
+.reading-list{max-height:110px;overflow-y:auto;display:flex;flex-direction:column;gap:2px}
+.reading-item{display:flex;justify-content:space-between;align-items:center;padding:3px 6px;border-radius:4px;background:var(--surface2);font-family:var(--mono);font-size:9px;animation:fadeIn .2s ease}
+.reading-val{font-weight:700}
+.reading-val.excellent{color:#0077ff}
+.reading-val.good{color:var(--accent)}
+.reading-val.fair{color:#ffd700}
+.reading-val.poor{color:var(--warn)}
+.reading-val.bad{color:#ff2040}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:none}}
+
+/* ── Legend ── */
+.legend-bar{height:6px;border-radius:3px;background:linear-gradient(to right,#ff2040,#ff6b35,#ffd700,#00e5a0,#0077ff);margin-bottom:3px}
+.legend-labels{display:flex;justify-content:space-between;font-family:var(--mono);font-size:8px;color:var(--text3)}
+
+/* ── Room list ── */
+.room-list-item{display:flex;justify-content:space-between;align-items:center;padding:3px 6px;border-radius:4px;background:var(--surface2);margin-bottom:3px;font-size:10px}
+.room-delete{background:none;border:none;color:var(--text3);cursor:pointer;font-size:12px;transition:color .15s}
+.room-delete:hover{color:var(--warn)}
+
+/* ── Canvas overlays ── */
+.canvas-overlay{position:absolute;top:10px;left:10px;background:rgba(10,12,16,.85);border:1px solid var(--border2);border-radius:7px;padding:5px 9px;font-family:var(--mono);font-size:9px;color:var(--text2);pointer-events:none;backdrop-filter:blur(4px);display:flex;flex-direction:column;gap:2px}
+.canvas-floor-badge{position:absolute;top:10px;right:10px;background:rgba(10,12,16,.85);border:1px solid rgba(0,229,160,.2);border-radius:7px;padding:4px 10px;font-family:var(--mono);font-size:10px;color:var(--accent);pointer-events:none;letter-spacing:.1em}
+.trilat-overlay{position:absolute;bottom:10px;left:10px;background:rgba(10,12,16,.85);border:1px solid var(--border2);border-radius:7px;padding:5px 9px;font-family:var(--mono);font-size:9px;color:var(--text2);pointer-events:none;backdrop-filter:blur(4px);display:none;flex-direction:column;gap:2px}
+.map-tooltip{position:absolute;background:rgba(10,12,16,.96);border:1px solid var(--border2);border-radius:7px;padding:7px 10px;font-family:var(--mono);font-size:9px;color:var(--text2);pointer-events:none;z-index:10;display:none;backdrop-filter:blur(4px);min-width:150px;max-width:210px}
+.map-tooltip.visible{display:block}
+.tt-name{font-size:11px;color:var(--text);font-weight:700;margin-bottom:3px}
+.tt-row{display:flex;justify-content:space-between;gap:8px;margin-bottom:1px}
+.alert-pulse-overlay{position:absolute;inset:0;pointer-events:none;opacity:0}
+.alert-pulse-overlay.active{animation:alertPulse 1.5s ease-in-out 3}
+@keyframes alertPulse{0%{opacity:0}50%{opacity:1}100%{opacity:0}}
+.ws-config{background:var(--surface2);border-radius:var(--radius);padding:9px}
+.hint{font-size:10px;color:var(--text3);line-height:1.5;font-style:italic}
+.trilat-badge{display:inline-flex;align-items:center;gap:3px;font-family:var(--mono);font-size:8px;padding:1px 4px;border-radius:3px}
+.trilat-badge.trilat-1{background:rgba(255,107,53,.12);color:var(--warn)}
+.trilat-badge.trilat-2{background:rgba(255,215,0,.1);color:#ffd700}
+.trilat-badge.trilat-3{background:rgba(0,229,160,.12);color:var(--accent)}
+</style>
+</head>
+<body>
+
+<!-- Auth overlay -->
+<div id="authOverlay">
+  <div class="auth-box">
+    <div class="auth-logo">WIFI<span>/</span>MAP</div>
+    <div class="auth-subtitle">Security Platform v5.3</div>
+    <div class="auth-field"><label class="auth-label" for="authUser">USERNAME</label><input class="auth-input" type="text" id="authUser" placeholder="admin" autocomplete="username"/></div>
+    <div class="auth-field"><label class="auth-label" for="authPass">PASSWORD</label><input class="auth-input" type="password" id="authPass" placeholder="••••••••" autocomplete="current-password"/></div>
+    <div class="auth-error" id="authError">Invalid credentials. Please try again.</div>
+    <button class="auth-btn" onclick="AuthModule.login()">Sign In</button>
+    <div class="auth-version">Default: admin / wifimap</div>
+  </div>
+</div>
+
+<!-- MSP Overview Overlay -->
+<div id="mspOverlay">
+  <div class="msp-header">
+    <div class="msp-logo">WIFI<span>/</span>MAP <span style="font-size:9px;margin-left:4px">MSP Dashboard</span></div>
+    <div class="msp-hdr-right">
+      <div class="msp-pill"><div class="pill-dot" id="aggDot"></div><span id="aggStatus">disconnected</span></div>
+      <div class="msp-pill"><span id="aggSiteCount" style="color:var(--accent)">0</span>&nbsp;sites</div>
+      <span class="alert-badge" id="mspAlertBadge" style="display:none">0 alerts</span>
+      <button class="msp-back-btn" onclick="SiteRegistry.hideMSP()">← Single Site View</button>
+      <button class="hdr-logout" onclick="AuthModule.logout()" style="margin-left:4px">Sign out</button>
+    </div>
+  </div>
+  <div class="msp-body">
+    <div class="msp-section-label">Client Sites</div>
+    <div class="msp-grid" id="mspSiteGrid">
+      <div class="msp-empty"><div class="msp-empty-icon">◎</div>No sites connected.<br>Configure aggregation server URL below and connect Pi scanners.</div>
+    </div>
+  </div>
+</div>
+
+<div id="renderErrorBanner">⚠ Canvas render error — auto-recovering. If this persists, refresh the page.</div>
+<!-- Banners -->
+<div id="versionBanner">⚠ Scanner version mismatch — update wifi_scanner.py to v5.3</div>
+<div id="persistBanner">
+  <span>💾 Floor plan restored from last session</span>
+  <button onclick="PersistModule.clear()" style="background:none;border:1px solid rgba(0,229,160,.3);border-radius:4px;color:var(--accent);font-family:var(--mono);font-size:9px;padding:2px 8px;cursor:pointer">Clear saved data</button>
+  <button onclick="document.getElementById('persistBanner').classList.remove('visible')" style="background:none;border:none;color:var(--text3);font-family:var(--mono);font-size:11px;cursor:pointer;padding:0 4px">×</button>
+</div>
+
+<header>
+  <div class="logo">WIFI<span>/</span>MAP <span style="font-size:9px;margin-left:5px;color:var(--text3)">v5.3</span></div>
+  <div class="hdr-pills">
+    <div class="hdr-pill"><div class="pill-dot auth" id="authDot"></div><span id="authUser2">—</span></div>
+    <div class="hdr-pill"><div class="pill-dot" id="wsDot"></div><span id="wsStatus">disconnected</span></div>
+    <div class="hdr-pill"><div class="pill-dot" id="aggDotHdr"></div><span id="aggStatusHdr" style="color:var(--text3)">MSP</span></div>
+    <div class="hdr-pill"><div class="pill-dot" id="piholeDot"></div><span id="piholeStatus">Pi-hole</span><span id="piholeCount" style="color:var(--text2)"></span></div>
+    <div class="hdr-pill"><div class="pill-dot" id="ntfyDot"></div><span id="ntfyStatus">Ntfy</span></div>
+    <div class="hdr-pill"><div class="pill-dot saved" id="saveDot" title="Auto-saving to localStorage"></div><span id="saveStatus">saved</span></div>
+    <div class="hdr-pill"><span id="readingCount" style="color:var(--text)">0</span>&nbsp;rdgs</div>
+    <div class="hdr-pill"><span id="deviceCount" style="color:var(--accent)">0</span>&nbsp;devices</div>
+    <span class="alert-badge" id="alertBadge">0 alerts</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:8px">
+    <button onclick="SiteRegistry.showMSP()" style="background:none;border:1px solid rgba(0,229,160,.3);border-radius:4px;color:var(--accent);font-family:var(--mono);font-size:9px;padding:3px 9px;cursor:pointer;transition:all .15s" title="MSP multi-site overview">⊞ MSP View</button>
+    <div id="lastUpdate" style="font-family:var(--mono);font-size:9px;color:var(--text3);white-space:nowrap">—</div>
+    <button class="hdr-logout" onclick="AuthModule.logout()">Sign out</button>
+  </div>
+</header>
+
+<div class="floor-bar" id="floorBar"><button class="floor-add" onclick="FloorModule.add()" title="Add floor">+</button></div>
+
+<div class="main">
+
+  <!-- COL 1: Tools -->
+  <div class="panel">
+    <div>
+      <div class="section-label">Tools</div>
+      <button class="tool-btn active" id="toolDraw"   onclick="CanvasModule.setTool('draw')">  <span class="tool-icon">▭</span> Draw Room</button>
+      <button class="tool-btn zone-tool" id="toolZone" onclick="CanvasModule.setTool('zone')"> <span class="tool-icon">◈</span> Draw Zone</button>
+      <button class="tool-btn" id="toolAP"     onclick="CanvasModule.setTool('ap')">           <span class="tool-icon">◎</span> Place AP</button>
+      <button class="tool-btn" id="toolSensor" onclick="CanvasModule.setTool('sensor')">       <span class="tool-icon">+</span> Manual Rdg</button>
+      <button class="tool-btn" id="toolDrag"   onclick="CanvasModule.setTool('drag')">         <span class="tool-icon">⊹</span> Drag Devices</button>
+      <button class="tool-btn" id="toolPan"    onclick="CanvasModule.setTool('pan')">          <span class="tool-icon">✥</span> Pan View</button>
+    </div>
+    <div id="zoneDrawConfig" style="display:none">
+      <div class="section-label" style="color:var(--critical)">New Zone</div>
+      <div class="field-row"><div class="field-label">Name</div><input class="field-input" id="zoneNameInput" placeholder="Server Room"/></div>
+      <div class="field-row"><div class="field-label">Type</div>
+        <select class="select-input" id="zoneTypeInput"><option value="restricted">Restricted</option><option value="monitored" selected>Monitored</option><option value="safe">Safe</option><option value="perimeter">Perimeter</option></select>
+      </div>
+      <div class="field-row"><div class="field-label">Alert tier</div>
+        <select class="select-input" id="zoneAlertTierInput"><option value="critical">Critical</option><option value="warning" selected>Warning</option><option value="info">Info</option></select>
+      </div>
+      <div class="hint">Drag to draw zone on floor plan.</div>
+    </div>
+    <div>
+      <div class="section-label">Floor</div>
+      <div class="field-row"><div class="field-label">Floor name</div><input class="field-input" id="floorNameEdit" placeholder="Ground Floor" oninput="FloorModule.renameActive(this.value)"/></div>
+      <div class="field-row"><div class="field-label">Room name</div><input class="field-input" id="roomName" placeholder="Living Room"/></div>
+      <button class="secondary-btn" onclick="FloorModule.clearActive()">Clear Floor</button>
+    </div>
+    <div><div class="section-label">Rooms (<span id="roomCount">0</span>)</div><div id="roomList"></div></div>
+    <div>
+      <div class="section-label">Display</div>
+      <div class="field-row"><div class="field-label">Heatmap opacity</div>
+        <div class="opacity-row"><input type="range" min="0" max="100" value="70" id="heatmapOpacity" oninput="State.display.heatmapOpacity=this.value/100;document.getElementById('opacityVal').textContent=this.value+'%';PersistModule.save();State.dirty=true"/><span class="opacity-val" id="opacityVal">70%</span></div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:10px;color:var(--text2)"><input type="checkbox" id="showGrid"    checked onchange="PersistModule.save();State.dirty=true"> Grid</label>
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:10px;color:var(--text2)"><input type="checkbox" id="showValues"  checked onchange="PersistModule.save();State.dirty=true"> Signal values</label>
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:10px;color:var(--text2)"><input type="checkbox" id="showAPs"     checked onchange="PersistModule.save();State.dirty=true"> Access points</label>
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:10px;color:var(--text2)"><input type="checkbox" id="showZones"   checked onchange="PersistModule.save();State.dirty=true"> Zones</label>
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:10px;color:var(--text2)"><input type="checkbox" id="showDevices" checked onchange="PersistModule.save();State.dirty=true"> Devices</label>
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:10px;color:var(--text2)"><input type="checkbox" id="showOffline" checked onchange="PersistModule.save();State.dirty=true"> Offline</label>
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:10px;color:var(--text2)"><input type="checkbox" id="showTrails"  checked onchange="PersistModule.save();State.dirty=true"> Trails</label>
+      </div>
+      <div class="field-row" style="margin-top:6px"><div class="field-label">Trail length</div>
+        <div class="opacity-row"><input type="range" min="3" max="20" value="10" id="trailLength" oninput="CONFIG.TRAIL_LENGTH=parseInt(this.value);document.getElementById('trailLenVal').textContent=this.value;PersistModule.save();State.dirty=true"/><span class="opacity-val" id="trailLenVal">10</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- COL 2: Canvas -->
+  <div class="canvas-area" id="canvasArea">
+    <canvas id="floorCanvas"></canvas>
+    <div class="canvas-overlay"><span id="overlayHint">Drag to draw rooms</span><span style="color:var(--text3)" id="overlayCoords"></span></div>
+    <div class="canvas-floor-badge" id="canvasFloorBadge">GROUND FLOOR</div>
+    <div class="trilat-overlay" id="trilatOverlay"><span style="color:var(--text3);font-size:8px">TRILATERATION</span><span id="trilatNodes" style="color:var(--accent)">0 nodes</span><span id="trilatAccuracy" style="color:var(--text3)">—</span></div>
+    <div class="alert-pulse-overlay" id="alertPulseOverlay" style="border:3px solid var(--critical)"></div>
+    <div class="map-tooltip" id="mapTooltip"></div>
+  </div>
+
+  <!-- COL 3: Signal + nodes + connection -->
+  <div class="panel-right">
+    <div>
+      <div class="section-label">Pi Nodes (<span id="piNodeCount">0</span>)</div>
+      <div class="hint" style="margin-bottom:6px">Drag node markers on the map to set position. Position saves automatically.</div>
+      <div id="piNodeList"><div class="hint">No nodes connected.</div></div>
+    </div>
+    <div>
+      <div class="section-label">Ghost Floors</div>
+      <div class="opacity-row" style="margin-bottom:6px"><input type="range" min="0" max="55" value="18" id="ghostOpacity" oninput="State.display.ghostOpacity=this.value/100;document.getElementById('ghostOpVal').textContent=this.value+'%';PersistModule.save();State.dirty=true"><span class="opacity-val" id="ghostOpVal">18%</span></div>
+      <div id="ghostControls"><div class="hint">Add a second floor.</div></div>
+    </div>
+    <div>
+      <div class="section-label">Connection</div>
+      <div class="ws-config">
+        <div class="field-label" style="margin-bottom:4px;color:var(--text3);font-size:9px">SINGLE SITE</div>
+        <div class="field-row"><div class="field-label">Pi IP</div><input class="field-input" id="wsHost" value="192.168.1.100"></div>
+        <div class="field-row"><div class="field-label">Port</div><input class="field-input" type="number" id="wsPort" value="8765"></div>
+        <button class="primary-btn" onclick="WSModule.connect()">Connect</button>
+        <button class="secondary-btn" onclick="WSModule.disconnect()">Disconnect</button>
+      </div>
+      <div class="agg-config" style="margin-top:8px">
+        <div class="field-label" style="margin-bottom:6px;color:var(--text3);font-size:9px">MSP AGGREGATION SERVER</div>
+        <div class="field-row"><div class="field-label">URL</div><input class="field-input" id="aggUrl" placeholder="ws://100.64.0.2:8767" oninput="PersistModule.save()"></div>
+        <button class="primary-btn" onclick="SiteRegistry.connect()" style="margin-top:4px">Connect MSP</button>
+        <button class="secondary-btn" onclick="SiteRegistry.showMSP()">Open MSP View</button>
+        <div style="font-family:var(--mono);font-size:8px;color:var(--text3);margin-top:4px">Use Tailscale IP of aggregation server</div>
+      </div>
+    </div>
+    <div>
+      <div class="section-label">Signal Stats</div>
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-label">Best</div>  <div class="stat-value green"  id="statBest">—</div></div>
+        <div class="stat-card"><div class="stat-label">Worst</div> <div class="stat-value orange" id="statWorst">—</div></div>
+        <div class="stat-card"><div class="stat-label">Avg</div>   <div class="stat-value blue"   id="statAvg">—</div></div>
+        <div class="stat-card"><div class="stat-label">Pts</div>   <div class="stat-value"        id="statPoints">0</div></div>
+      </div>
+    </div>
+    <div><div class="section-label">Legend</div><div class="legend-bar"></div><div class="legend-labels"><span>Weak</span><span>Fair</span><span>Good</span><span>Excellent</span></div></div>
+    <div><div class="section-label">Recent Readings</div><div class="reading-list" id="readingList"></div></div>
+    <div>
+      <div class="section-label">Export / Import</div>
+      <button class="secondary-btn" onclick="App.exportJSON()">Export JSON</button>
+      <button class="secondary-btn" onclick="App.exportPNG()">Save PNG</button>
+      <button class="secondary-btn" onclick="App.exportPDF()">Export PDF Report</button>
+      <button class="secondary-btn" onclick="App.importJSON()">Import JSON</button>
+    </div>
+  </div>
+
+  <!-- COL 4: Security -->
+  <div class="panel-right">
+    <div>
+      <div class="section-label" style="display:flex;justify-content:space-between;align-items:center">
+        <span>Active Alerts</span>
+        <button onclick="AlertModule.acknowledgeAll()" style="background:none;border:none;color:var(--text3);font-size:9px;font-family:var(--mono);cursor:pointer">ack all</button>
+      </div>
+      <div id="alertFeed"><div class="hint">No active alerts.</div></div>
+    </div>
+    <div>
+      <div class="section-label">Zones (<span id="zoneCount">0</span>)</div>
+      <div id="zoneList"><div class="hint">Draw zones using the zone tool.</div></div>
+    </div>
+    <div>
+      <div class="section-label" style="display:flex;justify-content:space-between;align-items:center">
+        <span>Event Log (<span id="eventLogCount">0</span>)</span>
+        <div style="display:flex;gap:4px">
+          <button onclick="AlertModule.filterLog('all')"      style="background:none;border:none;color:var(--accent);font-size:9px;font-family:var(--mono);cursor:pointer">all</button>
+          <button onclick="AlertModule.filterLog('critical')" style="background:none;border:none;color:var(--text3);font-size:9px;font-family:var(--mono);cursor:pointer">crit</button>
+          <button onclick="AlertModule.filterLog('warning')"  style="background:none;border:none;color:var(--text3);font-size:9px;font-family:var(--mono);cursor:pointer">warn</button>
+        </div>
+      </div>
+      <div id="eventLog" style="max-height:220px;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <!-- COL 5: Devices + Anomaly + Notify -->
+  <div class="panel-right">
+    <div>
+      <div class="section-label">Devices</div>
+      <div class="dev-counts">
+        <div class="dev-count"><div class="dev-count-val green" id="countOnline">0</div><div class="dev-count-label">Online</div></div>
+        <div class="dev-count"><div class="dev-count-val gray"  id="countOffline">0</div><div class="dev-count-label">Offline</div></div>
+        <div class="dev-count"><div class="dev-count-val red"   id="countFlagged">0</div><div class="dev-count-label">Flagged</div></div>
+      </div>
+      <div class="filter-bar">
+        <button class="filter-btn active" id="filterAll"     onclick="DeviceModule.setFilter('all')">All</button>
+        <button class="filter-btn"        id="filterOnline"  onclick="DeviceModule.setFilter('online')">Online</button>
+        <button class="filter-btn"        id="filterFlagged" onclick="DeviceModule.setFilter('flagged')">Flagged</button>
+      </div>
+      <input class="field-input" id="deviceSearch" placeholder="Search…" oninput="DeviceModule.renderList()" style="margin-bottom:6px">
+      <div id="deviceList"></div>
+    </div>
+    <div><div class="section-label">Anomaly Scores</div><div id="anomalyList"><div class="hint">Scores build over time.</div></div></div>
+    <div>
+      <div class="section-label">Notifications (Ntfy)</div>
+      <div class="notify-section">
+        <div class="field-row"><div class="field-label">Ntfy server URL</div><input class="field-input" id="ntfyServer" placeholder="http://pi-ip:7777" oninput="PersistModule.save()"></div>
+        <div class="field-row"><div class="field-label">Topic</div><input class="field-input" id="ntfyTopic" value="wifimap-alerts" oninput="PersistModule.save()"></div>
+        <button class="primary-btn" onclick="NotifyModule.configure()">Save & Test</button>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--text3);padding:6px 0" id="ntfyConfigStatus">Not configured</div>
+      </div>
+      <div>
+        <div class="tier-row"><span class="tier-label-crit">Critical</span><span style="font-size:10px;color:var(--text3)">Always notify</span><input type="checkbox" id="notifyCritical" checked onchange="PersistModule.save()"></div>
+        <div class="tier-row"><span class="tier-label-warn">Warning</span><span style="font-size:10px;color:var(--text3)">Notify</span><input type="checkbox" id="notifyWarning" checked onchange="PersistModule.save()"></div>
+        <div class="tier-row" style="border:none"><span class="tier-label-info">Info</span><span style="font-size:10px;color:var(--text3)">Log only</span><input type="checkbox" id="notifyInfo" onchange="PersistModule.save()"></div>
+      </div>
+      <p class="hint" style="margin-top:6px">Settings save automatically. Works on local network — no internet required.</p>
+    </div>
+  </div>
+</div>
+
+
+<script>
+/* ============================================================
+   SANITISATION HELPERS
+   ============================================================ */
+function sanitise(str) {
+  if (str === null || str === undefined) return '';
+  const div = document.createElement('div');
+  div.textContent = String(str);
+  return div.textContent;
+}
+function safeText(el, text) { if (el) el.textContent = sanitise(text); }
+function safeNode(text) { return document.createTextNode(sanitise(text)); }
+function sanitiseFields(obj, fields) { fields.forEach(f => { if (obj[f] !== undefined) obj[f] = sanitise(obj[f]); }); return obj; }
+
+
+/* ============================================================
+   AUTH MODULE
+   ============================================================ */
+const AuthModule = (() => {
+  const SESSION_KEY = 'wifimap_auth_token';
+  const SESSION_USER = 'wifimap_auth_user';
+  let currentToken = null, currentUser = null;
+
+  async function sha256(str) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+  }
+
+  async function login() {
+    const userEl = document.getElementById('authUser');
+    const passEl = document.getElementById('authPass');
+    const errorEl = document.getElementById('authError');
+    const username = sanitise(userEl.value.trim());
+    const password = passEl.value;
+    if (!username || !password) { errorEl.classList.add('visible'); errorEl.textContent='Please enter username and password.'; return; }
+    const token = await sha256(`${username}:${password}`);
+    const DEFAULT_HASH = await sha256('admin:wifimap');
+    const stored = sessionStorage.getItem(SESSION_KEY);
+    if (token === DEFAULT_HASH || (stored && token === stored)) {
+      currentToken = token; currentUser = username;
+      sessionStorage.setItem(SESSION_KEY, token);
+      sessionStorage.setItem(SESSION_USER, username);
+      onAuthSuccess(username);
+    } else {
+      errorEl.classList.add('visible'); errorEl.textContent='Invalid credentials.'; passEl.value='';
+    }
+  }
+
+  function onAuthSuccess(username) {
+    document.getElementById('authOverlay').style.display = 'none';
+    document.getElementById('authDot').className = 'pill-dot auth';
+    safeText(document.getElementById('authUser2'), username);
+  }
+
+  function logout() {
+    sessionStorage.removeItem(SESSION_KEY); sessionStorage.removeItem(SESSION_USER);
+    window.location.reload();
+  }
+
+  function checkExistingSession() {
+    const t = sessionStorage.getItem(SESSION_KEY);
+    const u = sessionStorage.getItem(SESSION_USER);
+    if (t && u) { currentToken=t; currentUser=u; onAuthSuccess(u); return true; }
+    return false;
+  }
+
+  function getToken() { return currentToken; }
+  function isAuthed() { return currentToken !== null; }
+
+  document.getElementById('authPass')?.addEventListener('keydown', e => { if (e.key==='Enter') login(); });
+  document.getElementById('authUser')?.addEventListener('keydown', e => { if (e.key==='Enter') document.getElementById('authPass')?.focus(); });
+
+  return { login, logout, checkExistingSession, getToken, isAuthed };
+})();
+
+
+/* ============================================================
+   LOGGER
+   ============================================================ */
+const Logger = (() => {
+  let level = 2;
+  const p = t => `[WiFiMap][${t}]`;
+  return {
+    setLevel(l) { level=l; },
+    error(...a) { if(level>=0) console.error(p('ERROR'),...a); },
+    warn(...a)  { if(level>=1) console.warn(p('WARN'),...a); },
+    info(...a)  { if(level>=2) console.log(p('INFO'),...a); },
+    debug(...a) { if(level>=3) console.log(p('DEBUG'),...a); },
+  };
+})();
+
+
+/* ============================================================
+   CONFIG
+   ============================================================ */
+const CONFIG = {
+  WS_VERSION: 1,
+  STORAGE_VERSION: 1,      // increment when State schema changes
+  STORAGE_KEY: 'wifimap_v52',
+  GRID_CELL: 28, HEATMAP_STEP: 8, HEATMAP_STEP_GHOST: 14, IDW_POWER: 1.8,
+  DEVICE_RADIUS: 11, DEVICE_HIT_RADIUS: 12, DEVICE_PULSE_GROWTH: 8,
+  PI_NODE_RADIUS: 10, PI_NODE_HIT_RADIUS: 14,  // slightly larger hit area for drag
+  MAX_READING_LIST: 20, MAX_READINGS_PER_FLOOR: 500,
+  TRILAT_TX_POWER: -59, TRILAT_PATH_LOSS_N: 2.7, TRILAT_SMOOTH: 0.25,
+  TRILAT_UPDATE_INTERVAL: 1500,
+  TRAIL_LENGTH: 10, TRAIL_OPACITY: 0.40,
+  PIHOLE_SYNC_INTERVAL: 60000,
+  RSSI: { EXCELLENT:-50, GOOD:-60, FAIR:-70, POOR:-80 },
+  LATENCY: { GOOD:20, OK:80 },
+  DEFAULT_HEATMAP_OPACITY: 0.70,
+  ANOMALY: { MAC_SPOOF_WEIGHT:40, UNKNOWN_DEVICE_WEIGHT:25, RAPID_MOVE_WEIGHT:20, HIGH_DNS_WEIGHT:15, PERIMETER_DWELL_WEIGHT:10, DECAY_RATE:0.95, FLAG_THRESHOLD:60 },
+  ZONE_PULSE_DURATION: 3000,
+  MAX_EVENT_LOG: 200,
+  SAVE_DEBOUNCE_MS: 500,  // debounce saves to avoid thrashing on rapid changes
+};
+
+
+/* ============================================================
+   EVENT BUS
+   ============================================================ */
+const EventBus = (() => {
+  const L = new Map();
+  return {
+    on(e,fn)  { if(!L.has(e))L.set(e,new Set()); L.get(e).add(fn); },
+    off(e,fn) { L.get(e)?.delete(fn); },
+    emit(e,d) { Logger.debug(`EventBus:'${e}'`); L.get(e)?.forEach(fn=>{ try{fn(d);}catch(err){Logger.error(`EventBus:'${e}':`,err);} }); },
+  };
+})();
+
+
+/* ============================================================
+   STATE
+   ============================================================ */
+const State = {
+  floors: [{ id:0, name:'Ground Floor', rooms:[], accessPoints:[], readings:[], zones:[] }],
+  activeFloorId: 0,
+  devices: {},
+  ghostVisibility: {},
+  display: { heatmapOpacity:0.70, ghostOpacity:0.18 },
+  interaction: { tool:'draw', isDrawing:false, drawStart:null, isPanning:false, panStart:null, isDraggingDevice:false, draggingDeviceId:null, dragOffset:{x:0,y:0}, isDraggingNode:false, draggingNodeLabel:null },
+  pan: {x:0,y:0},
+  canvasW:0, canvasH:0,
+  dirty: false,
+  ws: null,
+  totalReadings: 0,
+  deviceFilter: 'all',
+  selectedDeviceId: null,
+  hoveredDeviceId: null,
+  hoveredNodeLabel: null,
+  piNodes: {},          // label → { label, x, y, online, placed, ... }
+  deviceSignals: {},
+  approvedDevices: {},  // mac → { approved, approvedAt }
+  knownAPs: {},
+  zoneDrawStart: null,
+  selectedZoneId: null,
+  activeAlerts: [],
+  eventLog: [],
+  logFilter: 'all',
+  ntfyConfigured: false,
+  ntfyServer: '',
+  ntfyTopic: '',
+  scannerVersion: null,
+  wsHost: '192.168.1.100',
+  wsPort: 8765,
+  aggUrl: '',
+};
+
+
+/* ============================================================
+   PERSIST MODULE
+   ============================================================
+   Automatic localStorage persistence.
+
+   What's saved:
+     - Floor plan (floors, rooms, zones, APs, readings)
+     - Pi node canvas positions (authoritative — overrides scanner)
+     - Approved device registry
+     - Display preferences
+     - Ntfy configuration
+     - Pan position and active floor
+     - Connection settings (host/port)
+
+   What's NOT saved (regenerated from scanner on connect):
+     - Live device list (comes from scanner on reconnect)
+     - Active alerts (come from event_replay on reconnect)
+     - WebSocket connection state
+
+   Schema versioning:
+     STORAGE_KEY includes version number.
+     On version change, old data is silently discarded.
+     The user sees the persist-restored banner only when data was actually loaded.
+   ============================================================ */
+const PersistModule = (() => {
+  let saveTimer = null;
+
+  /**
+   * Serialise the parts of State that should survive a page refresh.
+   * Sets and functions are stripped — only plain data.
+   */
+  function serialise() {
+    return {
+      schemaVersion: CONFIG.STORAGE_VERSION,
+      savedAt:       Date.now(),
+
+      // Floor plan — the core product data
+      floors: State.floors.map(f => ({
+        id:           f.id,
+        name:         f.name,
+        rooms:        f.rooms,
+        accessPoints: f.accessPoints,
+        // Don't save readings in localStorage — can be large and stale
+        // They come back when the scanner reconnects
+        readings:     [],
+        // Zones saved with Set fields converted to arrays
+        zones: (f.zones||[]).map(z => ({
+          ...z,
+          allowedMacs:  [...(z.allowedMacs||[])],
+          activeAlerts: [],  // reset on reload — will be repopulated by scanner
+        })),
+      })),
+      activeFloorId: State.activeFloorId,
+      ghostVisibility: State.ghostVisibility,
+      pan: State.pan,
+
+      // Pi node positions — authoritative, override scanner hints
+      // Stored separately so they survive even if no scanner is connected
+      piNodePositions: Object.fromEntries(
+        Object.entries(State.piNodes)
+          .filter(([,n]) => n.placed)  // only save nodes the user has explicitly placed
+          .map(([label, n]) => [label, { x: n.x, y: n.y, placed: true }])
+      ),
+
+      // Approved devices — must survive restarts
+      approvedDevices: State.approvedDevices,
+
+      // Display preferences
+      display: State.display,
+      prefs: {
+        showGrid:    document.getElementById('showGrid')?.checked    ?? true,
+        showValues:  document.getElementById('showValues')?.checked  ?? true,
+        showAPs:     document.getElementById('showAPs')?.checked     ?? true,
+        showZones:   document.getElementById('showZones')?.checked   ?? true,
+        showDevices: document.getElementById('showDevices')?.checked ?? true,
+        showOffline: document.getElementById('showOffline')?.checked ?? true,
+        showTrails:  document.getElementById('showTrails')?.checked  ?? true,
+        trailLength: CONFIG.TRAIL_LENGTH,
+      },
+
+      // Ntfy config
+      ntfy: {
+        server:          State.ntfyServer,
+        topic:           State.ntfyTopic,
+        configured:      State.ntfyConfigured,
+        notifyCritical:  document.getElementById('notifyCritical')?.checked ?? true,
+        notifyWarning:   document.getElementById('notifyWarning')?.checked  ?? true,
+        notifyInfo:      document.getElementById('notifyInfo')?.checked     ?? false,
+      },
+
+      // Connection settings
+      connection: {
+        host:   document.getElementById('wsHost')?.value  || State.wsHost,
+        port:   parseInt(document.getElementById('wsPort')?.value) || State.wsPort,
+        aggUrl: document.getElementById('aggUrl')?.value  || '',
+      },
+
+      // Event log — persist last 200 events so log survives refresh
+      eventLog: State.eventLog.slice(0, CONFIG.MAX_EVENT_LOG),
+    };
+  }
+
+  /**
+   * Save State to localStorage.
+   * Debounced — rapid mutations only trigger one write.
+   */
+  function save() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      try {
+        const data = JSON.stringify(serialise());
+        localStorage.setItem(CONFIG.STORAGE_KEY, data);
+        setSaveIndicator('saved');
+        Logger.debug(`PersistModule.save: ${(data.length/1024).toFixed(1)}KB`);
+      } catch (e) {
+        Logger.warn('PersistModule.save: failed', e.message);
+        setSaveIndicator('error');
+      }
+    }, CONFIG.SAVE_DEBOUNCE_MS);
+  }
+
+  /**
+   * Load State from localStorage.
+   * Called once on init, before first render.
+   * Returns true if data was loaded, false if nothing was stored.
+   */
+  function load() {
+    try {
+      const raw = localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (!raw) return false;
+
+      const data = JSON.parse(raw);
+
+      // Schema version check — discard stale data
+      if (data.schemaVersion !== CONFIG.STORAGE_VERSION) {
+        Logger.warn(`PersistModule.load: schema version mismatch (stored=${data.schemaVersion} current=${CONFIG.STORAGE_VERSION}) — discarding`);
+        localStorage.removeItem(CONFIG.STORAGE_KEY);
+        return false;
+      }
+
+      // Restore floors — convert zone allowedMacs arrays back to Sets
+      if (data.floors?.length) {
+        State.floors = data.floors.map(f => ({
+          ...f,
+          readings: [],  // readings regenerated from scanner, not localStorage
+          zones: (f.zones||[]).map(z => ({
+            ...z,
+            allowedMacs:  new Set(z.allowedMacs||[]),
+            activeAlerts: new Set(),
+          })),
+        }));
+        // Validate activeFloorId
+        State.activeFloorId = State.floors.find(f => f.id === data.activeFloorId)
+          ? data.activeFloorId
+          : State.floors[0].id;
+      }
+
+      // Restore ghost visibility
+      if (data.ghostVisibility) State.ghostVisibility = data.ghostVisibility;
+
+      // Restore pan
+      if (data.pan) State.pan = data.pan;
+
+      // Restore Pi node positions — these override scanner positions
+      if (data.piNodePositions) {
+        Object.entries(data.piNodePositions).forEach(([label, pos]) => {
+          if (!State.piNodes[label]) State.piNodes[label] = { label, online:false, rssiTable:{} };
+          State.piNodes[label].x      = pos.x;
+          State.piNodes[label].y      = pos.y;
+          State.piNodes[label].placed = true;
+        });
+        Logger.info(`PersistModule.load: restored ${Object.keys(data.piNodePositions).length} Pi node positions`);
+      }
+
+      // Restore approved devices
+      if (data.approvedDevices) State.approvedDevices = data.approvedDevices;
+
+      // Restore display
+      if (data.display) State.display = data.display;
+
+      // Restore display preferences
+      if (data.prefs) {
+        const p = data.prefs;
+        // Applied after DOM is ready in restorePrefsToDOM()
+        PersistModule._pendingPrefs = p;
+      }
+
+      // Restore Ntfy config
+      if (data.ntfy) {
+        State.ntfyServer    = data.ntfy.server || '';
+        State.ntfyTopic     = data.ntfy.topic  || '';
+        State.ntfyConfigured = data.ntfy.configured || false;
+        PersistModule._pendingNtfy = data.ntfy;
+      }
+
+      // Restore connection settings
+      if (data.connection) {
+        State.wsHost = data.connection.host || State.wsHost;
+        State.wsPort = data.connection.port || State.wsPort;
+        State.aggUrl = data.connection.aggUrl || '';
+      }
+
+      // Restore event log
+      if (data.eventLog?.length) {
+        State.eventLog = data.eventLog;
+        Logger.info(`PersistModule.load: restored ${data.eventLog.length} event log entries`);
+      }
+
+      const age = Math.round((Date.now() - data.savedAt) / 60000);
+      Logger.info(`PersistModule.load: restored state (saved ${age}m ago)`);
+      return true;
+
+    } catch (e) {
+      Logger.warn('PersistModule.load: failed, starting fresh', e.message);
+      localStorage.removeItem(CONFIG.STORAGE_KEY);
+      return false;
+    }
+  }
+
+  /**
+   * Apply restored preferences to DOM elements.
+   * Called after DOM is ready (deferred from load()).
+   */
+  function restorePrefsToDOM() {
+    const p = PersistModule._pendingPrefs;
+    if (!p) return;
+    const set = (id, val) => { const el=document.getElementById(id); if(el) el.checked=val; };
+    set('showGrid',    p.showGrid);
+    set('showValues',  p.showValues);
+    set('showAPs',     p.showAPs);
+    set('showZones',   p.showZones);
+    set('showDevices', p.showDevices);
+    set('showOffline', p.showOffline);
+    set('showTrails',  p.showTrails);
+    if (p.trailLength) {
+      CONFIG.TRAIL_LENGTH = p.trailLength;
+      const el = document.getElementById('trailLength');
+      if (el) el.value = p.trailLength;
+      safeText(document.getElementById('trailLenVal'), p.trailLength);
+    }
+    const hm = document.getElementById('heatmapOpacity');
+    if (hm) { hm.value = Math.round(State.display.heatmapOpacity * 100); safeText(document.getElementById('opacityVal'), hm.value+'%'); }
+    const go = document.getElementById('ghostOpacity');
+    if (go) { go.value = Math.round(State.display.ghostOpacity * 100); safeText(document.getElementById('ghostOpVal'), go.value+'%'); }
+    delete PersistModule._pendingPrefs;
+  }
+
+  function restoreNtfyToDOM() {
+    const n = PersistModule._pendingNtfy;
+    if (!n) return;
+    const s = document.getElementById('ntfyServer'); if (s) s.value = n.server || '';
+    const t = document.getElementById('ntfyTopic');  if (t) t.value = n.topic  || '';
+    const set = (id, val) => { const el=document.getElementById(id); if(el) el.checked=val; };
+    set('notifyCritical', n.notifyCritical ?? true);
+    set('notifyWarning',  n.notifyWarning  ?? true);
+    set('notifyInfo',     n.notifyInfo     ?? false);
+    if (n.configured && n.server && n.topic) {
+      State.ntfyConfigured = true;
+      const dot = document.getElementById('ntfyDot'); if (dot) dot.className='pill-dot on';
+      safeText(document.getElementById('ntfyConfigStatus'), `Active → ${sanitise(n.topic)}`);
+    }
+    delete PersistModule._pendingNtfy;
+  }
+
+  function restoreConnectionToDOM() {
+    const h = document.getElementById('wsHost');  if (h) h.value = State.wsHost;
+    const p = document.getElementById('wsPort');  if (p) p.value = State.wsPort;
+    const a = document.getElementById('aggUrl');  if (a && State.aggUrl) a.value = State.aggUrl;
+  }
+
+  /** Clear all saved data and reload. */
+  function clear() {
+    if (!confirm('Clear all saved floor plan data? This cannot be undone.')) return;
+    localStorage.removeItem(CONFIG.STORAGE_KEY);
+    window.location.reload();
+  }
+
+  function setSaveIndicator(state) {
+    const dot = document.getElementById('saveDot');
+    const lbl = document.getElementById('saveStatus');
+    if (state === 'saved') {
+      if (dot) dot.className='pill-dot saved';
+      safeText(lbl, 'saved');
+    } else {
+      if (dot) dot.className='pill-dot err';
+      safeText(lbl, 'save error');
+    }
+  }
+
+  return { save, load, restorePrefsToDOM, restoreNtfyToDOM, restoreConnectionToDOM, clear };
+})();
+
+
+/* ============================================================
+   OUI VENDOR LOOKUP
+   ============================================================ */
+const OUI = { '00:50:f2':'Microsoft','00:1a:11':'Google','b8:27:eb':'Raspberry Pi','dc:a6:32':'Raspberry Pi','e4:5f:01':'Raspberry Pi','28:cd:c1':'Apple','f4:db:e6':'Apple','a8:51:ab':'Apple','b4:fb:e4':'Apple','44:85:00':'Amazon','68:37:e9':'Amazon','00:17:88':'Philips Hue','18:b4:30':'Nest','94:35:0a':'Samsung','b8:e9:37':'Sonos','fc:fb:fb':'Cisco','00:50:56':'VMware' };
+const vendorFromMac = mac => !mac?'Unknown':(OUI[mac.toLowerCase().substring(0,8)]||'Unknown vendor');
+
+
+/* ============================================================
+   PI-HOLE MODULE
+   ============================================================ */
+const PiholeModule = (() => {
+  let interval=null; let cache={};
+  async function fetchHostnames(host) {
+    const sh=sanitise(host).replace(/[^a-zA-Z0-9.\-:]/g,''); let map={};
+    try{const r=await fetch(`http://${sh}/api/network`,{signal:AbortSignal.timeout(5000)});if(r.ok){const d=await r.json();(d.network||d.clients||[]).forEach(e=>{const mac=sanitise(e.hwaddr||e.mac||'').toLowerCase();const name=sanitise(e.name||e.hostname||'').trim();if(mac&&name&&name!=='localhost')map[mac]=name;});}}catch(e){Logger.debug('PiholeModule v6:',e.message);}
+    if(!Object.keys(map).length){try{const r=await fetch(`http://${sh}/admin/api.php?networkmap`,{signal:AbortSignal.timeout(5000)});if(r.ok){const d=await r.json();Object.values(d.network||{}).forEach(e=>{const mac=sanitise(e.hwaddr||'').toLowerCase();const name=sanitise(e.name||'').trim();if(mac&&name&&name!=='localhost')map[mac]=name;});}}catch(e){Logger.debug('PiholeModule v5:',e.message);}}
+    cache={...cache,...map};applyToDevices();
+    const dot=document.getElementById('piholeDot');const cnt=document.getElementById('piholeCount');
+    if(Object.keys(cache).length){dot.className='pill-dot ph';safeText(cnt,`${Object.keys(cache).length} names`);}
+  }
+  function applyToDevices(){Object.values(State.devices).forEach(d=>{const h=cache[d.mac];if(h){d.piholeHostname=h;if(!d.userRenamed)d.name=h;}});DeviceModule.renderList();}
+  function hostnameForMac(mac){return cache[mac?.toLowerCase()]||null;}
+  function start(host){if(interval)clearInterval(interval);fetchHostnames(host);interval=setInterval(()=>fetchHostnames(host),CONFIG.PIHOLE_SYNC_INTERVAL);}
+  function stop(){if(interval){clearInterval(interval);interval=null;}}
+  EventBus.on('device:discovered',d=>{const h=hostnameForMac(d.mac);if(h&&!d.userRenamed){d.piholeHostname=h;d.name=h;}});
+  return{start,stop,hostnameForMac};
+})();
+
+
+/* ============================================================
+   TRILATERATION MODULE
+   ============================================================ */
+const TrilaterationModule = (() => {
+  const STALE=5000;
+  function rssiToDist(rssi){return Math.pow(10,(CONFIG.TRILAT_TX_POWER-rssi)/(10*CONFIG.TRILAT_PATH_LOSS_N));}
+  function mToPx(m){return m*CONFIG.GRID_CELL;}
+  function getRefs(mac){
+    const sigs=State.deviceSignals[mac];if(!sigs)return[];const now=Date.now();
+    return Object.entries(sigs).reduce((acc,[lbl,r])=>{
+      if(now-r.timestamp>STALE)return acc;
+      const node=State.piNodes[lbl];if(!node||node.x===undefined||!node.placed)return acc;
+      acc.push({x:node.x,y:node.y,distance:mToPx(rssiToDist(r.rssi)),rssi:r.rssi,lbl});
+      return acc;
+    },[]);
+  }
+  function centroid(refs){let tw=0,wx=0,wy=0;refs.forEach(r=>{const w=1/(r.distance+.1);wx+=r.x*w;wy+=r.y*w;tw+=w;});return{x:wx/tw,y:wy/tw};}
+  function estimate(mac){
+    const refs=getRefs(mac);if(!refs.length)return null;
+    let pos,method;
+    if(refs.length===1){const a=Math.random()*Math.PI*2;const off=Math.min(refs[0].distance*.3,60);pos={x:refs[0].x+Math.cos(a)*off,y:refs[0].y+Math.sin(a)*off};method='proximity';}
+    else if(refs.length===2){const w1=1/(refs[0].distance+.1),w2=1/(refs[1].distance+.1),t=w1+w2;pos={x:(refs[0].x*w1+refs[1].x*w2)/t,y:(refs[0].y*w1+refs[1].y*w2)/t};method='bilateration';}
+    else{
+      const piv=refs[0];let a00=0,a01=0,a11=0,b0=0,b1=0;
+      for(let i=1;i<refs.length;i++){const r=refs[i];const ax=2*(r.x-piv.x),ay=2*(r.y-piv.y);const bv=r.distance**2-piv.distance**2-r.x**2+piv.x**2-r.y**2+piv.y**2;a00+=ax*ax;a01+=ax*ay;a11+=ay*ay;b0+=ax*bv;b1+=ay*bv;}
+      const det=a00*a11-a01*a01;
+      if(Math.abs(det)<1e-10){pos=centroid(refs);method='centroid';}
+      else{const x=(b0*a11-b1*a01)/det,y=(a00*b1-a01*b0)/det;const m=200;if(x<-m||x>State.canvasW+m||y<-m||y>State.canvasH+m){pos=centroid(refs);method='centroid';}else{pos={x,y};method='trilateration';}}
+    }
+    return{...pos,nodeCount:refs.length,method};
+  }
+  function updateAll(){
+    let n=0;
+    Object.values(State.devices).forEach(d=>{
+      if(!d.online||d.pinned)return;
+      const result=estimate(d.mac);if(!result)return;
+      const px=d.x,py=d.y;
+      d.x=px+(result.x-px)*(1-CONFIG.TRILAT_SMOOTH);d.y=py+(result.y-py)*(1-CONFIG.TRILAT_SMOOTH);
+      d.trilat={nodeCount:result.nodeCount,method:result.method};
+      const moved=Math.sqrt((d.x-px)**2+(d.y-py)**2);
+      if(moved>2){TrailModule.record(d.mac,d.x,d.y);ZoneModule.checkDeviceZones(d);n++;}
+    });
+    if(n>0){updateOverlay();State.dirty=true;}
+  }
+  function recordSignal(mac,lbl,rssi,px,py){if(!State.deviceSignals[mac])State.deviceSignals[mac]={};State.deviceSignals[mac][lbl]={rssi,x:px,y:py,timestamp:Date.now()};}
+  function updateOverlay(){
+    const ov=document.getElementById('trilatOverlay');
+    const n=Object.values(State.piNodes).filter(p=>p.online&&p.placed).length;
+    if(!n){ov.style.display='none';return;}
+    ov.style.display='flex';
+    safeText(document.getElementById('trilatNodes'),`${n} node${n!==1?'s':''} placed`);
+    safeText(document.getElementById('trilatAccuracy'),n>=3?'± 2–5m':n===2?'± zone':'proximity only');
+  }
+  setInterval(updateAll,CONFIG.TRILAT_UPDATE_INTERVAL);
+  return{recordSignal,estimate,updateAll};
+})();
+
+
+/* ============================================================
+   TRAIL MODULE
+   ============================================================ */
+const TrailModule = (() => {
+  const trails={};
+  function record(mac,x,y){if(!trails[mac])trails[mac]=[];trails[mac].push({x,y,t:Date.now()});while(trails[mac].length>CONFIG.TRAIL_LENGTH)trails[mac].shift();}
+  function draw(ctx,mac){
+    const t=trails[mac]||[];if(t.length<2)return;const n=t.length;
+    t.forEach((pt,i)=>{const p=i/(n-1);const op=Math.pow(p,.6)*CONFIG.TRAIL_OPACITY;ctx.beginPath();ctx.arc(pt.x,pt.y,2+p*3,0,Math.PI*2);ctx.fillStyle=`rgba(0,229,160,${op})`;ctx.fill();});
+    for(let i=0;i<t.length-1;i++){const p=i/(t.length-1);ctx.beginPath();ctx.moveTo(t[i].x,t[i].y);ctx.lineTo(t[i+1].x,t[i+1].y);ctx.strokeStyle=`rgba(0,229,160,${Math.pow(p,.8)*CONFIG.TRAIL_OPACITY*.5})`;ctx.lineWidth=.8;ctx.stroke();}
+  }
+  function clear(mac){delete trails[mac];}
+  return{record,draw,clear};
+})();
+
+
+/* ============================================================
+   ZONE MODULE
+   ============================================================ */
+const ZoneModule = (() => {
+  const FILLS={restricted:'rgba(255,32,64,0.12)',monitored:'rgba(255,107,53,0.10)',safe:'rgba(0,229,160,0.08)',perimeter:'rgba(140,100,255,0.10)'};
+  const STROKES={restricted:'rgba(255,32,64,0.5)',monitored:'rgba(255,107,53,0.4)',safe:'rgba(0,229,160,0.35)',perimeter:'rgba(140,100,255,0.4)'};
+
+  function isActive(zone){
+    if(zone.schedule?.always)return true;
+    const now=new Date();const h=now.getHours().toString().padStart(2,'0')+':'+now.getMinutes().toString().padStart(2,'0');
+    return(zone.schedule?.days||[]).includes(now.getDay())&&h>=(zone.schedule?.hours?.start||'00:00')&&h<=(zone.schedule?.hours?.end||'23:59');
+  }
+  function pointIn(zone,x,y){return x>=zone.x&&x<=zone.x+zone.w&&y>=zone.y&&y<=zone.y+zone.h;}
+  function findZone(id){for(const f of State.floors){const z=(f.zones||[]).find(z=>z.id===id);if(z)return z;}return null;}
+  function activeFloorZones(){return FloorModule.active().zones||[];}
+
+  function addZone(rect){
+    const name=sanitise(document.getElementById('zoneNameInput').value.trim())||null;
+    const type=sanitise(document.getElementById('zoneTypeInput').value);
+    const alertTier=sanitise(document.getElementById('zoneAlertTierInput').value);
+    const floor=FloorModule.active();
+    const zone={id:Date.now(),name:name||`${type} zone`,floorId:floor.id,x:rect.x,y:rect.y,w:rect.w,h:rect.h,type,alertTier,schedule:{always:true,hours:{start:'00:00',end:'23:59'},days:[0,1,2,3,4,5,6]},allowedMacs:new Set(),activeAlerts:new Set(),lastPulse:0};
+    floor.zones.push(zone);
+    // Persist zone to scanner for cross-browser/restart survival
+    WSModule.sendZone(zone, 'add');
+    PersistModule.save();
+    renderZoneList();State.dirty=true;
+  }
+
+  function removeZone(id){
+    State.floors.forEach(f=>{f.zones=f.zones.filter(z=>z.id!==id);});
+    if(State.selectedZoneId===id)State.selectedZoneId=null;
+    WSModule.sendZoneDelete(id);
+    PersistModule.save();
+    renderZoneList();State.dirty=true;
+  }
+
+  function editSchedule(id){
+    const zone=findZone(id);if(!zone)return;
+    const always=confirm(`Is zone "${sanitise(zone.name)}" always active?\nOK=always   Cancel=set hours`);
+    zone.schedule={...zone.schedule,always};
+    if(!always){
+      const s=prompt('Active from (HH:MM):',zone.schedule.hours?.start||'09:00');
+      const e=prompt('Active until (HH:MM):',zone.schedule.hours?.end||'18:00');
+      const re=/^\d{2}:\d{2}$/;
+      if(s&&re.test(s))zone.schedule.hours={...zone.schedule.hours,start:s};
+      if(e&&re.test(e))zone.schedule.hours={...zone.schedule.hours,end:e};
+    }
+    WSModule.sendZone(zone,'update');
+    PersistModule.save();
+    renderZoneList();
+  }
+
+  function checkDeviceZones(device){
+    const floor=FloorModule.getById(device.floorId);if(!floor?.zones)return;
+    floor.zones.forEach(zone=>{
+      const inside=pointIn(zone,device.x,device.y);const was=zone.activeAlerts.has(device.mac);
+      if(inside&&!was){zone.activeAlerts.add(device.mac);if(isActive(zone)){SecurityModule.fireEvent({severity:zone.alertTier,type:'zone_violation',title:`Device entered ${zone.type} zone`,description:`"${sanitise(device.name)}" entered zone "${sanitise(zone.name)}"`,device,zone,location:sanitise(zone.name)});}}
+      else if(!inside&&was){zone.activeAlerts.delete(device.mac);}
+    });
+  }
+
+  function renderZoneList(){
+    const list=document.getElementById('zoneList');const zones=activeFloorZones();
+    safeText(document.getElementById('zoneCount'),zones.length);
+    if(!zones.length){list.innerHTML='';const h=document.createElement('div');h.className='hint';h.textContent='Draw zones using the zone tool.';list.appendChild(h);return;}
+    list.innerHTML='';
+    zones.forEach(z=>{
+      const card=document.createElement('div');card.className=`zone-card ${State.selectedZoneId===z.id?'selected':''}`;
+      card.onclick=()=>{State.selectedZoneId=z.id;renderZoneList();State.dirty=true;};
+      const top=document.createElement('div');top.className='zone-top';
+      const dot=document.createElement('div');dot.className='zone-color-dot';dot.style.background=STROKES[z.type];
+      const nm=document.createElement('div');nm.className='zone-name';nm.textContent=sanitise(z.name);
+      const badge=document.createElement('span');badge.className=`zone-type-badge ${sanitise(z.type)}`;badge.textContent=sanitise(z.type);
+      top.append(dot,nm,badge);
+      const meta=document.createElement('div');meta.className='zone-meta';
+      const sched=z.schedule?.always?'always active':`${sanitise(z.schedule?.hours?.start||'')}–${sanitise(z.schedule?.hours?.end||'')}`;
+      const alerts=z.activeAlerts?.size||0;
+      meta.textContent=`${sched} · tier: ${sanitise(z.alertTier)}${!isActive(z)?' · inactive':''}${alerts?` · ${alerts} inside`:''}`;
+      const actions=document.createElement('div');actions.className='zone-actions';
+      const bs=document.createElement('button');bs.className='zone-btn';bs.textContent='Schedule';bs.onclick=e=>{e.stopPropagation();editSchedule(z.id);};
+      const bd=document.createElement('button');bd.className='zone-btn';bd.textContent='Delete';bd.onclick=e=>{e.stopPropagation();removeZone(z.id);};
+      actions.append(bs,bd);card.append(top,meta,actions);list.appendChild(card);
+    });
+  }
+
+  /** Load zones received from scanner (zone_load message). */
+  function loadFromScanner(zones) {
+    const floor = FloorModule.active();
+    if (!zones?.length) return;
+    zones.forEach(z => {
+      const exists = floor.zones.find(fz => fz.id === z.id);
+      if (!exists) {
+        floor.zones.push({
+          ...z,
+          allowedMacs:  new Set(z.allowedMacs||[]),
+          activeAlerts: new Set(),
+          lastPulse:    0,
+        });
+      }
+    });
+    PersistModule.save();
+    renderZoneList();
+    State.dirty=true;
+    Logger.info(`ZoneModule.loadFromScanner: loaded ${zones.length} zones`);
+  }
+
+  function draw(ctx,floor,isGhost,alpha){
+    if(!document.getElementById('showZones').checked)return;
+    (floor.zones||[]).forEach(zone=>{
+      ctx.fillStyle=FILLS[zone.type]||'rgba(255,255,255,0.05)';ctx.fillRect(zone.x,zone.y,zone.w,zone.h);
+      ctx.strokeStyle=STROKES[zone.type]||'rgba(255,255,255,0.3)';ctx.lineWidth=State.selectedZoneId===zone.id?2:1;
+      if(!isActive(zone)&&!isGhost)ctx.setLineDash([6,4]);
+      ctx.strokeRect(zone.x,zone.y,zone.w,zone.h);ctx.setLineDash([]);
+      if(!isGhost){
+        ctx.fillStyle=STROKES[zone.type];ctx.font='8px Space Mono,monospace';
+        ctx.fillText(sanitise(zone.name).toUpperCase().substring(0,20),zone.x+6,zone.y+14);
+        if(zone.activeAlerts?.size>0&&isActive(zone)){const elapsed=Date.now()-zone.lastPulse;if(elapsed<CONFIG.ZONE_PULSE_DURATION){const t=1-elapsed/CONFIG.ZONE_PULSE_DURATION;ctx.fillStyle=`rgba(255,32,64,${Math.sin(t*Math.PI*3)*.25*t})`;ctx.fillRect(zone.x,zone.y,zone.w,zone.h);}}
+      }
+    });
+  }
+
+  return{addZone,removeZone,editSchedule,isActive,pointIn,findZone,activeFloorZones,checkDeviceZones,renderZoneList,loadFromScanner,draw,FILLS,STROKES};
+})();
+
+
+/* ============================================================
+   SECURITY MODULE
+   ============================================================ */
+const SecurityModule = (() => {
+  const anomalyScores={};
+  function fireEvent(event){
+    const e={id:Date.now()+Math.random(),severity:sanitise(event.severity)||'info',type:sanitise(event.type),title:sanitise(event.title),description:sanitise(event.description)||'',device:event.device||null,zone:event.zone||null,location:sanitise(event.location)||'—',timestamp:Date.now(),acknowledged:false};
+    State.eventLog.unshift(e);if(State.eventLog.length>CONFIG.MAX_EVENT_LOG)State.eventLog.pop();
+    if(e.severity==='critical'||e.severity==='warning')State.activeAlerts.unshift(e);
+    if(e.zone)e.zone.lastPulse=Date.now();
+    if(e.severity==='critical'){const o=document.getElementById('alertPulseOverlay');o.classList.remove('active');void o.offsetWidth;o.classList.add('active');}
+    AlertModule.render();NotifyModule.send(e);
+    PersistModule.save();  // persist event log on every new event
+    EventBus.emit('security:event',e);
+    return e;
+  }
+  function checkNewDevice(device){
+    if(State.approvedDevices[device.mac])return;
+    fireEvent({severity:'critical',type:'new_device',title:'Unrecognised device on network',description:`MAC: ${device.mac} · Vendor: ${device.vendor} · IP: ${device.ip}`,device,location:'Network'});
+    updateAnomalyScore(device.mac,CONFIG.ANOMALY.UNKNOWN_DEVICE_WEIGHT,'Unknown device');
+  }
+  function checkAP(ap){
+    const key=(ap.bssid||'').toLowerCase();if(!key||State.knownAPs[key])return;
+    State.knownAPs[key]={...ap,firstSeen:Date.now(),approved:false};
+    fireEvent({severity:'critical',type:'rogue_ap',title:'Rogue access point detected',description:`SSID: "${sanitise(ap.ssid)}" · BSSID: ${sanitise(ap.bssid)} · ${sanitise(String(ap.rssi))}dBm`,location:`Seen by ${sanitise(ap.piLabel)}`});
+  }
+  function checkMACSpoof(ip,mac1,mac2){
+    if(mac1===mac2)return;
+    fireEvent({severity:'critical',type:'mac_spoof',title:'Possible MAC address spoofing',description:`IP ${sanitise(ip)} changed MAC: ${sanitise(mac1)} → ${sanitise(mac2)}`,location:sanitise(ip)});
+    updateAnomalyScore(mac2,CONFIG.ANOMALY.MAC_SPOOF_WEIGHT,'MAC spoof signal');
+  }
+  function updateAnomalyScore(mac,weight,reason){
+    if(!anomalyScores[mac])anomalyScores[mac]={score:0,reasons:[]};
+    anomalyScores[mac].score=Math.min(100,anomalyScores[mac].score+weight);
+    const r=sanitise(reason);if(!anomalyScores[mac].reasons.includes(r))anomalyScores[mac].reasons.push(r);
+    const d=State.devices[mac];if(d){d.riskScore=anomalyScores[mac].score;d.flagged=anomalyScores[mac].score>=CONFIG.ANOMALY.FLAG_THRESHOLD;}
+    DeviceModule.updateCounts();renderAnomalyList();
+  }
+  function decayScores(){
+    Object.keys(anomalyScores).forEach(mac=>{
+      anomalyScores[mac].score*=CONFIG.ANOMALY.DECAY_RATE;if(anomalyScores[mac].score<1)anomalyScores[mac].score=0;
+      const d=State.devices[mac];if(d){d.riskScore=anomalyScores[mac].score;d.flagged=anomalyScores[mac].score>=CONFIG.ANOMALY.FLAG_THRESHOLD;}
+    });
+    renderAnomalyList();
+  }
+  function renderAnomalyList(){
+    const list=document.getElementById('anomalyList');
+    const items=Object.entries(anomalyScores).filter(([,v])=>v.score>2).sort(([,a],[,b])=>b.score-a.score).slice(0,10);
+    if(!items.length){list.innerHTML='';const h=document.createElement('div');h.className='hint';h.textContent='No anomalies detected.';list.appendChild(h);return;}
+    list.innerHTML='';
+    items.forEach(([mac,data])=>{
+      const device=State.devices[mac];const name=sanitise(device?.name||mac.substring(0,12)+'…');const score=Math.round(data.score);
+      const color=score>=80?'var(--critical)':score>=50?'var(--warn)':'#ffd700';
+      const item=document.createElement('div');item.className='anomaly-item';item.title=data.reasons.map(sanitise).join(', ');
+      const n=document.createElement('div');n.className='anomaly-name';n.textContent=name;
+      const bw=document.createElement('div');bw.className='anomaly-bar-wrap';const b=document.createElement('div');b.className='anomaly-bar';b.style.cssText=`width:${score}%;background:${color}`;bw.appendChild(b);
+      const sv=document.createElement('div');sv.className='anomaly-score-val';sv.style.color=color;sv.textContent=score;
+      item.append(n,bw,sv);list.appendChild(item);
+    });
+  }
+  setInterval(decayScores,30000);
+  return{fireEvent,checkNewDevice,checkAP,checkMACSpoof,updateAnomalyScore,renderAnomalyList};
+})();
+
+
+/* ============================================================
+   ALERT MODULE
+   ============================================================ */
+const AlertModule = (() => {
+  function timeStr(ts){return new Date(ts).toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+  function render(){renderFeed();renderLog();updateBadge();}
+  function renderFeed(){
+    const feed=document.getElementById('alertFeed');const alerts=State.activeAlerts.filter(a=>!a.acknowledged);
+    if(!alerts.length){feed.innerHTML='';const h=document.createElement('div');h.className='hint';h.textContent='No active alerts.';feed.appendChild(h);return;}
+    feed.innerHTML='';
+    alerts.slice(0,10).forEach(a=>{
+      const item=document.createElement('div');item.className=`alert-item ${sanitise(a.severity)}`;
+      const dismiss=document.createElement('button');dismiss.className='alert-dismiss';dismiss.textContent='×';dismiss.onclick=()=>AlertModule.dismiss(a.id);
+      const hdr=document.createElement('div');hdr.className='alert-header';
+      const sev=document.createElement('span');sev.className=`alert-sev ${sanitise(a.severity)}`;sev.textContent=a.severity.toUpperCase();
+      const title=document.createElement('span');title.className='alert-title';title.textContent=sanitise(a.title);
+      const t=document.createElement('span');t.className='alert-time';t.textContent=timeStr(a.timestamp);
+      hdr.append(sev,title,t);
+      const body=document.createElement('div');body.className='alert-body';body.textContent=sanitise(a.description);
+      const meta=document.createElement('div');meta.className='alert-meta';meta.textContent=`Location: ${sanitise(a.location)}`;
+      const actions=document.createElement('div');actions.className='alert-actions';
+      const ack=document.createElement('button');ack.className='alert-btn';ack.textContent='Acknowledge';ack.onclick=()=>AlertModule.acknowledge(a.id);
+      actions.appendChild(ack);
+      if(a.device){
+        const loc=document.createElement('button');loc.className='alert-btn';loc.textContent='Locate';loc.onclick=()=>DeviceModule.locate(a.device.mac);actions.appendChild(loc);
+        const app=document.createElement('button');app.className='alert-btn';app.textContent='Approve';
+        app.onclick=()=>{DeviceModule.approveDevice(a.device.mac);AlertModule.dismiss(a.id);};
+        actions.appendChild(app);
+      }
+      item.append(dismiss,hdr,body,meta,actions);feed.appendChild(item);
+    });
+  }
+  function renderLog(){
+    const logEl=document.getElementById('eventLog');const filter=State.logFilter;
+    const items=State.eventLog.filter(e=>filter==='all'||e.severity===filter);
+    safeText(document.getElementById('eventLogCount'),items.length);
+    if(!items.length){logEl.innerHTML='';const h=document.createElement('div');h.className='hint';h.style.padding='4px 0';h.textContent='No events yet.';logEl.appendChild(h);return;}
+    logEl.innerHTML='';
+    items.slice(0,CONFIG.MAX_EVENT_LOG).forEach(e=>{
+      const item=document.createElement('div');item.className='log-item';
+      const dot=document.createElement('div');dot.className=`log-sev-dot ${sanitise(e.severity)}`;
+      const t=document.createElement('span');t.className='log-time';t.textContent=timeStr(e.timestamp);
+      const msg=document.createElement('span');msg.className='log-msg';msg.textContent=sanitise(e.title)+(e.device?` · ${sanitise(e.device.name||e.device.mac)}`:'');
+      item.append(dot,t,msg);logEl.appendChild(item);
+    });
+  }
+  function updateBadge(){const count=State.activeAlerts.filter(a=>!a.acknowledged).length;const badge=document.getElementById('alertBadge');safeText(badge,`${count} alert${count!==1?'s':''}`);badge.classList.toggle('visible',count>0);}
+  function filterLog(f){State.logFilter=f;renderLog();}
+  function acknowledge(id){const a=State.activeAlerts.find(a=>String(a.id)===String(id));if(a){a.acknowledged=true;PersistModule.save();}render();}
+  function dismiss(id){State.activeAlerts=State.activeAlerts.filter(a=>String(a.id)!==String(id));PersistModule.save();render();}
+  function acknowledgeAll(){State.activeAlerts.forEach(a=>a.acknowledged=true);PersistModule.save();render();}
+
+  /** Load event log from scanner replay message (event_replay). */
+  function loadReplay(events) {
+    if (!events?.length) return;
+    // Merge replayed events — don't duplicate events already in log
+    const existingIds = new Set(State.eventLog.map(e => e.id));
+    const newEvents = events.filter(e => !existingIds.has(e.id));
+    State.eventLog = [...State.eventLog, ...newEvents]
+      .sort((a,b) => b.timestamp - a.timestamp)
+      .slice(0, CONFIG.MAX_EVENT_LOG);
+    Logger.info(`AlertModule.loadReplay: merged ${newEvents.length} events from scanner`);
+    render();
+    PersistModule.save();
+  }
+
+  EventBus.on('security:event',()=>render());
+  return{render,filterLog,acknowledge,dismiss,acknowledgeAll,loadReplay};
+})();
+
+
+/* ============================================================
+   NOTIFY MODULE
+   ============================================================ */
+const NotifyModule = (() => {
+  async function configure(){
+    const server=sanitise(document.getElementById('ntfyServer').value.trim());
+    const topic=sanitise(document.getElementById('ntfyTopic').value.trim());
+    if(!server||!topic){alert('Please enter Ntfy server URL and topic.');return;}
+    try{new URL(server);}catch(e){alert('Invalid server URL.');return;}
+    State.ntfyServer=server;State.ntfyTopic=topic;
+    const ok=await sendRaw('WiFi/MAP connected','Notification system active.','low');
+    if(ok){State.ntfyConfigured=true;setStatus('configured');}else setStatus('error');
+    PersistModule.save();
+  }
+  async function send(event){
+    if(!State.ntfyConfigured)return;
+    const map={critical:'urgent',warning:'high',info:'default'};const emap={critical:'🚨',warning:'⚠️',info:'ℹ️',new_device:'📱',rogue_ap:'📡',mac_spoof:'🔒',zone_violation:'📍',deauth_attack:'⚡'};
+    const sev=sanitise(event.severity);
+    if(sev==='critical'&&!document.getElementById('notifyCritical')?.checked)return;
+    if(sev==='warning'&&!document.getElementById('notifyWarning')?.checked)return;
+    if(sev==='info'&&!document.getElementById('notifyInfo')?.checked)return;
+    const body=[sanitise(event.description),`Location: ${sanitise(event.location)}`,event.device?`Device: ${sanitise(event.device.name||event.device.mac)}`:null,new Date(event.timestamp).toLocaleTimeString()].filter(Boolean).join('\n');
+    await sendRaw(sanitise(event.title),body,map[sev]||'default',emap[sanitise(event.type)]||'');
+  }
+  async function sendRaw(title,body,priority='default',emoji=''){
+    if(!State.ntfyServer||!State.ntfyTopic)return false;
+    try{const res=await fetch(`${State.ntfyServer}/${encodeURIComponent(State.ntfyTopic)}`,{method:'POST',headers:{'Title':`${emoji} WiFi/MAP: ${title}`,'Priority':priority,'Tags':'wifi,security','Content-Type':'text/plain'},body,signal:AbortSignal.timeout(5000)});return res.ok;}
+    catch(e){Logger.warn('NotifyModule: send failed',e.message);return false;}
+  }
+  function setStatus(s){
+    const d=document.getElementById('ntfyDot');const st=document.getElementById('ntfyConfigStatus');
+    if(s==='configured'){if(d)d.className='pill-dot on';if(st)safeText(st,`Active → ${sanitise(State.ntfyTopic)}`);}
+    else if(s==='error'){if(d)d.className='pill-dot err';if(st)safeText(st,'Connection failed');}
+    else{if(d)d.className='pill-dot';if(st)safeText(st,'Not configured');}
+  }
+  return{configure,send};
+})();
+
+
+/* ============================================================
+   FLOOR MODULE
+   ============================================================ */
+const FloorModule = (() => {
+  function getById(id){return State.floors.find(f=>f.id===id);}
+  function indexOf(id){return State.floors.findIndex(f=>f.id===id);}
+  function active(){return getById(State.activeFloorId);}
+  function add(){const names=['Ground Floor','Level 1','Level 2','Level 3','Basement','Mezzanine','Roof'];const id=Date.now();State.floors.push({id,name:names[State.floors.length]||`Floor ${State.floors.length}`,rooms:[],accessPoints:[],readings:[],zones:[]});State.ghostVisibility[id]=true;switchTo(id);PersistModule.save();}
+  function switchTo(id){if(!getById(id))return;State.activeFloorId=id;renderTabs();renderGhostControls();UIModule.syncFloorName();UIModule.renderRoomList();UIModule.updateStats();ZoneModule.renderZoneList();State.dirty=true;safeText(document.getElementById('canvasFloorBadge'),active().name.toUpperCase());PersistModule.save();}
+  function renameActive(name){active().name=sanitise(name)||'Unnamed';renderTabs();safeText(document.getElementById('canvasFloorBadge'),active().name.toUpperCase());PersistModule.save();}
+  function remove(id){if(State.floors.length<=1){alert('Need at least one floor.');return;}State.floors=State.floors.filter(f=>f.id!==id);if(State.activeFloorId===id)switchTo(State.floors[0].id);else{renderTabs();renderGhostControls();State.dirty=true;}PersistModule.save();}
+  function clearActive(){const f=active();if(!confirm(`Clear all data on "${sanitise(f.name)}"?`))return;f.rooms=[];f.accessPoints=[];f.readings=[];f.zones=[];UIModule.renderRoomList();UIModule.updateStats();ZoneModule.renderZoneList();renderTabs();State.dirty=true;PersistModule.save();}
+  function renderTabs(){
+    const bar=document.getElementById('floorBar');const add=bar.querySelector('.floor-add');bar.querySelectorAll('.floor-tab').forEach(t=>t.remove());const n=State.floors.length;
+    State.floors.forEach((f,i)=>{
+      const g=i===0?'▁':i===n-1?'▔':'▬';const tab=document.createElement('button');tab.className='floor-tab'+(f.id===State.activeFloorId?' active':'');
+      const gl=document.createElement('span');gl.className='floor-glyph';gl.textContent=g;const lbl=document.createElement('span');lbl.textContent=sanitise(f.name);const badge=document.createElement('span');badge.className='floor-badge';badge.textContent=f.readings.length;
+      tab.append(gl,lbl,badge);if(n>1){const del=document.createElement('button');del.className='tab-del';del.textContent='×';del.onclick=e=>{e.stopPropagation();remove(f.id);};tab.appendChild(del);}
+      tab.onclick=()=>switchTo(f.id);bar.insertBefore(tab,add);
+    });
+  }
+  function renderGhostControls(){
+    const c=document.getElementById('ghostControls');const others=State.floors.filter(f=>f.id!==State.activeFloorId);const ai=indexOf(State.activeFloorId);
+    if(!others.length){c.innerHTML='';const h=document.createElement('div');h.className='hint';h.textContent='Add a second floor.';c.appendChild(h);return;}
+    c.innerHTML='';
+    others.forEach(f=>{
+      const row=document.createElement('div');row.className='ghost-row';const left=document.createElement('div');left.className='ghost-row-left';
+      const rel=document.createElement('span');rel.style.cssText='font-size:9px;color:var(--text3)';rel.textContent=indexOf(f.id)<ai?'↓ below':'↑ above';
+      const nm=document.createElement('span');nm.style.cssText='font-family:var(--mono);font-size:10px;color:var(--text2)';nm.textContent=sanitise(f.name);
+      left.append(rel,nm);const toggle=document.createElement('button');toggle.className='mini-toggle '+(State.ghostVisibility[f.id]!==false?'on':'');
+      toggle.onclick=()=>{State.ghostVisibility[f.id]=!State.ghostVisibility[f.id];toggle.classList.toggle('on',State.ghostVisibility[f.id]);State.dirty=true;PersistModule.save();};
+      row.append(left,toggle);c.appendChild(row);
+    });
+  }
+  return{add,switchTo,renameActive,remove,clearActive,renderTabs,renderGhostControls,active,indexOf,getById};
+})();
+
+
+/* ============================================================
+   DEVICE MODULE
+   ============================================================ */
+const DeviceModule = (() => {
+  function latClass(ms){if(ms===null||ms===undefined)return'offline';if(ms<CONFIG.LATENCY.GOOD)return'good';if(ms<CONFIG.LATENCY.OK)return'ok';return'bad';}
+  function timeSince(ts){const s=Math.floor((Date.now()-ts)/1000);if(s<5)return'just now';if(s<60)return`${s}s`;if(s<3600)return`${Math.floor(s/60)}m`;return`${Math.floor(s/3600)}h`;}
+
+  function upsert(data){
+    sanitiseFields(data,['mac','ip','vendor','name','hostname','pi_label']);
+    const mac=data.mac||(data.ip+'_noMac');const isNew=!State.devices[mac];
+    if(!isNew&&data.ip){const ex=Object.values(State.devices).find(d=>d.ip===data.ip&&d.mac!==mac);if(ex)SecurityModule.checkMACSpoof(data.ip,ex.mac,mac);}
+    if(isNew){
+      const vendor=data.vendor||vendorFromMac(mac);const ph=PiholeModule.hostnameForMac(mac);
+      State.devices[mac]={id:mac,mac,ip:data.ip||'?',vendor,name:ph||data.name||vendor,piholeHostname:ph||null,userRenamed:false,online:data.online!==false,latency:data.latency??null,lastSeen:Date.now(),floorId:State.activeFloorId,x:data.piX!==undefined?data.piX+(Math.random()*40-20):State.canvasW*(.2+Math.random()*.6),y:data.piY!==undefined?data.piY+(Math.random()*40-20):State.canvasH*(.2+Math.random()*.6),pinned:false,history:[],trilat:null,riskScore:0,flagged:false};
+      Logger.info(`DeviceModule: NEW ${mac} (${data.ip})`);EventBus.emit('device:discovered',State.devices[mac]);SecurityModule.checkNewDevice(State.devices[mac]);
+    }else{
+      const d=State.devices[mac];d.ip=data.ip||d.ip;d.online=data.online!==false;d.latency=data.latency!==undefined?data.latency:d.latency;d.lastSeen=Date.now();
+      if(d.online&&data.latency!==null){d.history.push({t:Date.now(),latency:data.latency});if(d.history.length>20)d.history.shift();}
+      EventBus.emit('device:updated',d);
+    }
+    updateCounts();renderList();State.dirty=true;return isNew;
+  }
+
+  /** Approve a device — persists to scanner via WebSocket. */
+  function approveDevice(mac) {
+    State.approvedDevices[mac] = { approved:true, approvedAt:Date.now() };
+    const d = State.devices[mac];
+    if (d) { d.flagged=false; d.riskScore=0; }
+    WSModule.sendDeviceApproval(mac);
+    PersistModule.save();
+    updateCounts();renderList();State.dirty=true;
+    Logger.info(`DeviceModule.approveDevice: ${mac}`);
+  }
+
+  function loadApprovedFromScanner(approvedList) {
+    if (!approvedList?.length) return;
+    approvedList.forEach(entry => {
+      if (entry.mac) State.approvedDevices[entry.mac] = { approved:true, approvedAt:entry.approvedAt||Date.now() };
+    });
+    PersistModule.save();
+    Logger.info(`DeviceModule.loadApprovedFromScanner: ${approvedList.length} approved devices`);
+  }
+
+  function markOffline(mac){if(!State.devices[mac])return;State.devices[mac].online=false;EventBus.emit('device:offline',State.devices[mac]);updateCounts();renderList();State.dirty=true;}
+
+  function updateCounts(){
+    const all=Object.values(State.devices);const on=all.filter(d=>d.online).length;const fl=all.filter(d=>d.flagged).length;
+    safeText(document.getElementById('countOnline'),on);safeText(document.getElementById('countOffline'),all.length-on);safeText(document.getElementById('countFlagged'),fl);safeText(document.getElementById('deviceCount'),all.length);
+  }
+
+  function setFilter(f){State.deviceFilter=f;['All','Online','Flagged'].forEach(n=>document.getElementById('filter'+n)?.classList.toggle('active',f===n.toLowerCase()));renderList();}
+
+  function renderList(){
+    const search=sanitise(document.getElementById('deviceSearch')?.value.toLowerCase()||'');
+    const list=document.getElementById('deviceList');
+    let devs=Object.values(State.devices);
+    if(State.deviceFilter==='online')devs=devs.filter(d=>d.online);
+    if(State.deviceFilter==='flagged')devs=devs.filter(d=>d.flagged);
+    if(search)devs=devs.filter(d=>d.ip.includes(search)||d.name.toLowerCase().includes(search)||d.mac.toLowerCase().includes(search)||(d.piholeHostname||'').toLowerCase().includes(search));
+    devs.sort((a,b)=>(b.flagged-a.flagged)||(b.online-a.online)||a.name.localeCompare(b.name));
+    list.innerHTML='';
+    if(!devs.length){const h=document.createElement('div');h.className='hint';h.style.padding='4px 0';h.textContent='No devices.';list.appendChild(h);return;}
+    devs.forEach(d=>{
+      const card=document.createElement('div');card.className=`device-card ${d.online?'':'offline'} ${State.selectedDeviceId===d.id?'selected':''} ${d.flagged?'flagged':''}`;card.onclick=()=>DeviceModule.select(d.id);
+      const top=document.createElement('div');top.className='dc-top';
+      const dot=document.createElement('div');dot.className=`dc-dot ${d.online?'online':'offline'}`;
+      const nm=document.createElement('div');nm.className='dc-name';nm.textContent=sanitise(d.name)+(d.flagged?` ⚠${Math.round(d.riskScore)}`:'');if(d.flagged)nm.style.color='var(--critical)';
+      const lat=document.createElement('span');lat.className=`dc-latency ${latClass(d.latency)}`;lat.textContent=d.online?(d.latency!==null?d.latency+'ms':'…'):'—';
+      if(d.trilat){const tb=document.createElement('span');tb.className=`trilat-badge trilat-${Math.min(d.trilat.nodeCount,3)}`;tb.textContent=`${d.trilat.nodeCount}▲`;top.append(dot,nm,tb,lat);}else top.append(dot,nm,lat);
+      const meta=document.createElement('div');meta.className='dc-meta';
+      const ip=document.createElement('span');ip.className='dc-ip';ip.textContent=sanitise(d.ip);const mac=document.createElement('span');mac.textContent=sanitise(d.mac);const vendor=document.createElement('span');vendor.textContent=sanitise(d.vendor);meta.append(ip,mac,vendor);
+      if(d.piholeHostname){const ph=document.createElement('span');ph.className='dc-ph';ph.textContent=`⬤ ${sanitise(d.piholeHostname)}`;meta.appendChild(ph);}
+      const footer=document.createElement('div');footer.style.cssText='display:flex;align-items:center;justify-content:space-between;margin-top:4px';
+      const fp=document.createElement('span');fp.className='floor-pill';fp.textContent=sanitise(FloorModule.getById(d.floorId)?.name||'?');const ts=document.createElement('span');ts.style.cssText='font-family:var(--mono);font-size:8px;color:var(--text3)';ts.textContent=timeSince(d.lastSeen);footer.append(fp,ts);
+      const actions=document.createElement('div');actions.className='dc-actions';
+      [['Rename',()=>DeviceModule.rename(d.id)],['Approve',()=>DeviceModule.approveDevice(d.id)],['Pin',()=>DeviceModule.togglePin(d.id)],['Locate',()=>DeviceModule.locate(d.id)]].forEach(([lbl,fn])=>{const b=document.createElement('button');b.className='dc-btn';b.textContent=lbl;b.onclick=e=>{e.stopPropagation();fn();};actions.appendChild(b);});
+      card.append(top,meta,footer,actions);list.appendChild(card);
+    });
+  }
+
+  function select(id){State.selectedDeviceId=State.selectedDeviceId===id?null:id;renderList();State.dirty=true;}
+  function rename(id){const d=State.devices[id];if(!d)return;const n=prompt('Rename:',sanitise(d.name));if(n?.trim()){d.name=sanitise(n.trim());d.userRenamed=true;PersistModule.save();}renderList();State.dirty=true;}
+  function togglePin(id){const d=State.devices[id];if(!d)return;d.pinned=!d.pinned;if(!d.pinned)TrailModule.clear(id);PersistModule.save();renderList();State.dirty=true;}
+  function locate(id){const d=State.devices[id];if(!d)return;if(d.floorId!==State.activeFloorId)FloorModule.switchTo(d.floorId);State.pan.x=State.canvasW/2-d.x;State.pan.y=State.canvasH/2-d.y;State.selectedDeviceId=id;renderList();State.dirty=true;}
+  setInterval(()=>{if(Object.keys(State.devices).length>0)renderList();},5000);
+  return{upsert,markOffline,updateCounts,setFilter,renderList,select,rename,togglePin,locate,latClass,approveDevice,loadApprovedFromScanner};
+})();
+
+
+/* ============================================================
+   PI NODE MODULE
+   ============================================================ */
+const PiNodeModule = (() => {
+
+  /**
+   * Register or update a Pi node from a hello message.
+   * If the browser already has a saved position for
+   * this node label (from localStorage), it takes priority over
+   * whatever the scanner sent. The scanner position is only used
+   * if no saved position exists.
+   */
+  function register(data) {
+    const label = sanitise(data.label || 'unknown');
+    const existing = State.piNodes[label];
+
+    // Check localStorage for a saved position for this node
+    const hasSavedPosition = existing?.placed;
+
+    State.piNodes[label] = {
+      label,
+      // Saved canvas position takes priority over scanner hint
+      x:        hasSavedPosition ? existing.x : (data.x !== undefined ? data.x * State.canvasW : undefined),
+      y:        hasSavedPosition ? existing.y : (data.y !== undefined ? data.y * State.canvasH : undefined),
+      placed:   hasSavedPosition || (data.x !== undefined && data.y !== undefined),
+      online:   true,
+      demo:     !!data.demo,
+      lastSeen: Date.now(),
+      rssiTable: existing?.rssiTable || {},
+    };
+
+    Logger.info(`PiNodeModule: registered '${label}' placed=${State.piNodes[label].placed}`);
+    renderNodeList();
+    TrilaterationModule.updateAll();
+    TrilaterationModule.updateOverlay?.();
+  }
+
+  /**
+   * Place a Pi node at a specific canvas position.
+   * Called when the user drags a node marker to position it.
+   * Primary way operators position nodes — drag on canvas, position auto-saves.
+   */
+  function placeNode(label, x, y) {
+    const node = State.piNodes[label];
+    if (!node) return;
+    node.x      = x;
+    node.y      = y;
+    node.placed = true;
+
+    // Send position back to scanner for logging
+    WSModule.sendNodePosition(label, x / State.canvasW, y / State.canvasH);
+
+    // Persist immediately — position is critical data
+    PersistModule.save();
+
+    renderNodeList();
+    TrilaterationModule.updateAll();
+    State.dirty=true;
+
+    Logger.info(`PiNodeModule.placeNode: '${label}' at (${Math.round(x)}, ${Math.round(y)}) — canvas: (${(x/State.canvasW).toFixed(2)}, ${(y/State.canvasH).toFixed(2)})`);
+  }
+
+  function updateDeviceSignal(label, mac, rssi) {
+    const node = State.piNodes[label];
+    if (!node) return;
+    node.rssiTable[mac] = { rssi, timestamp:Date.now() };
+    node.lastSeen = Date.now();
+    if (node.placed) TrilaterationModule.recordSignal(mac, label, rssi, node.x, node.y);
+  }
+
+  function renderNodeList() {
+    const list = document.getElementById('piNodeList');
+    const cnt  = document.getElementById('piNodeCount');
+    const nodes = Object.values(State.piNodes);
+    safeText(cnt, nodes.length);
+
+    if (!nodes.length) {
+      list.innerHTML=''; const h=document.createElement('div');h.className='hint';h.textContent='No nodes connected.';list.appendChild(h);
+      return;
+    }
+
+    list.innerHTML = '';
+    nodes.forEach(n => {
+      const card = document.createElement('div');
+      card.className = `pi-node-card ${n.online?'active-node':''} ${!n.placed?'unplaced':''}`;
+
+      const dot = document.createElement('div');dot.className=`pi-node-dot ${n.online?'online':'offline'}`;
+      const info = document.createElement('div');info.className='pi-node-info';
+      const lbl  = document.createElement('div');lbl.className='pi-node-label';lbl.textContent=sanitise(n.label)+(n.demo?' [DEMO]':'');
+      const meta = document.createElement('div');meta.className='pi-node-meta';
+
+      if (n.placed) {
+        meta.textContent=`pos: (${(n.x/State.canvasW).toFixed(2)}, ${(n.y/State.canvasH).toFixed(2)}) · ${Object.keys(n.rssiTable).length} devices`;
+      } else {
+        meta.textContent=`${Object.keys(n.rssiTable).length} devices`;
+        const hint=document.createElement('div');hint.className='pi-place-hint';hint.textContent='⚠ Drag this node onto the floor plan to enable trilateration';
+        info.append(lbl,meta,hint);card.append(dot,info);list.appendChild(card);
+        return;
+      }
+
+      info.append(lbl,meta);card.append(dot,info);list.appendChild(card);
+    });
+  }
+
+  /** Check if a canvas point is within hit radius of any Pi node marker. */
+  function nodeAtPos(pos) {
+    for (const node of Object.values(State.piNodes)) {
+      if (!node.placed || node.x === undefined) continue;
+      const dx = pos.x - node.x, dy = pos.y - node.y;
+      if (Math.sqrt(dx*dx+dy*dy) <= CONFIG.PI_NODE_HIT_RADIUS) return node;
+    }
+    return null;
+  }
+
+  return { register, placeNode, updateDeviceSignal, renderNodeList, nodeAtPos };
+})();
+
+
+/* ============================================================
+   CANVAS MODULE
+   ============================================================ */
+const CanvasModule = (() => {
+  const canvas = document.getElementById('floorCanvas');
+  const ctx    = canvas.getContext('2d');
+  const area   = document.getElementById('canvasArea');
+  const tooltip= document.getElementById('mapTooltip');
+
+  function rssiToRGB(rssi){if(rssi>=CONFIG.RSSI.EXCELLENT)return[0,119,255];if(rssi>=CONFIG.RSSI.GOOD)return[0,229,160];if(rssi>=CONFIG.RSSI.FAIR)return[255,215,0];if(rssi>=CONFIG.RSSI.POOR)return[255,107,53];return[255,32,64];}
+  function rssiClass(rssi){if(rssi>=CONFIG.RSSI.EXCELLENT)return'excellent';if(rssi>=CONFIG.RSSI.GOOD)return'good';if(rssi>=CONFIG.RSSI.FAIR)return'fair';if(rssi>=CONFIG.RSSI.POOR)return'poor';return'bad';}
+  function getPos(e){const r=canvas.getBoundingClientRect();return{x:e.clientX-r.left-State.pan.x,y:e.clientY-r.top-State.pan.y};}
+  function normRect(a,b){return{x:Math.min(a.x,b.x),y:Math.min(a.y,b.y),w:Math.abs(b.x-a.x),h:Math.abs(b.y-a.y)};}
+
+  function drawHeatmap(readings,alpha,isGhost){
+    if(!readings.length)return;const step=isGhost?CONFIG.HEATMAP_STEP_GHOST:CONFIG.HEATMAP_STEP;
+    for(let px=-State.pan.x;px<State.canvasW-State.pan.x;px+=step){for(let py=-State.pan.y;py<State.canvasH-State.pan.y;py+=step){
+      let tw=0,wr=0;for(const r of readings){const d=Math.sqrt((px-r.x)**2+(py-r.y)**2);if(d<1){tw=1;wr=r.rssi;break;}const w=1/d**CONFIG.IDW_POWER;tw+=w;wr+=w*r.rssi;}
+      if(!tw)continue;const rssi=wr/tw;let[r,g,b]=rssiToRGB(rssi);
+      if(isGhost){const avg=(r+g+b)/3;r=Math.round(r*.25+avg*.75);g=Math.round(g*.25+avg*.75);b=Math.round(b*.25+avg*.75);}
+      ctx.fillStyle=`rgba(${r},${g},${b},${alpha*(isGhost?.5:.45)})`;ctx.fillRect(px,py,step+1,step+1);
+    }}
+  }
+
+  function drawFloor(floor,alpha,isGhost){
+    drawHeatmap(floor.readings,alpha,isGhost);
+    ZoneModule.draw(ctx,floor,isGhost,alpha);
+    floor.rooms.forEach(room=>{
+      ctx.fillStyle=isGhost?'rgba(255,255,255,0.01)':'rgba(255,255,255,0.03)';ctx.fillRect(room.x,room.y,room.w,room.h);
+      ctx.strokeStyle=isGhost?`rgba(255,255,255,${alpha*.22})`:'rgba(255,255,255,0.22)';ctx.lineWidth=isGhost?.8:1.5;ctx.strokeRect(room.x,room.y,room.w,room.h);
+      ctx.fillStyle=isGhost?`rgba(255,255,255,${alpha*.18})`:'rgba(255,255,255,0.32)';ctx.font=`${isGhost?9:10}px Space Mono,monospace`;ctx.fillText(sanitise(room.name).substring(0,25),room.x+7,room.y+(isGhost?12:14));
+    });
+    if(document.getElementById('showAPs').checked){
+      floor.accessPoints.forEach(ap=>{
+        const a=isGhost?alpha*.45:1;
+        [18,26,34].forEach((rv,i)=>{ctx.beginPath();ctx.arc(ap.x,ap.y,rv,0,Math.PI*2);ctx.strokeStyle=`rgba(0,119,255,${(.1-i*.03)*a})`;ctx.lineWidth=.8;ctx.stroke();});
+        ctx.beginPath();ctx.arc(ap.x,ap.y,11,0,Math.PI*2);ctx.fillStyle=`rgba(0,119,255,${.12*a})`;ctx.fill();ctx.strokeStyle=`rgba(0,119,255,${a})`;ctx.lineWidth=isGhost?.8:1.5;ctx.stroke();
+        ctx.fillStyle=`rgba(0,119,255,${a})`;ctx.font='bold 8px Space Mono,monospace';ctx.textAlign='center';ctx.fillText(sanitise(ap.label).substring(0,8),ap.x,ap.y+3);ctx.textAlign='left';
+      });
+    }
+    if(!isGhost){floor.readings.forEach(r=>{const[rc,gc,bc]=rssiToRGB(r.rssi);ctx.beginPath();ctx.arc(r.x,r.y,4,0,Math.PI*2);ctx.fillStyle=`rgb(${rc},${gc},${bc})`;ctx.fill();ctx.strokeStyle='rgba(0,0,0,0.5)';ctx.lineWidth=1;ctx.stroke();if(document.getElementById('showValues').checked){ctx.fillStyle=`rgb(${rc},${gc},${bc})`;ctx.font='8px Space Mono,monospace';ctx.fillText(r.rssi+'dBm',r.x+6,r.y-2);}});}
+  }
+
+  function drawDevices(){
+    if(!document.getElementById('showDevices').checked)return;
+    const showOff=document.getElementById('showOffline').checked;const showTrails=document.getElementById('showTrails').checked;const now=Date.now();
+    Object.values(State.devices).forEach(d=>{
+      if(d.floorId!==State.activeFloorId)return;if(!d.online&&!showOff)return;
+      if(showTrails&&d.online)TrailModule.draw(ctx,d.mac);
+      const isSel=State.selectedDeviceId===d.id;const isHov=State.hoveredDeviceId===d.id;
+      if(d.online){const pulse=(now%2000)/2000;const pr=CONFIG.DEVICE_RADIUS+pulse*CONFIG.DEVICE_PULSE_GROWTH;ctx.beginPath();ctx.arc(d.x,d.y,pr,0,Math.PI*2);ctx.fillStyle=`rgba(${d.flagged?'255,32,64':'0,229,160'},${.06*(1-pulse)})`;ctx.fill();}
+      if(isSel||isHov){ctx.beginPath();ctx.arc(d.x,d.y,17,0,Math.PI*2);ctx.strokeStyle=isSel?'rgba(0,229,160,.7)':'rgba(255,255,255,.2)';ctx.lineWidth=1.5;ctx.setLineDash([4,3]);ctx.stroke();ctx.setLineDash([]);}
+      if(d.flagged){ctx.beginPath();ctx.arc(d.x,d.y,CONFIG.DEVICE_RADIUS+3,0,Math.PI*2);ctx.strokeStyle='rgba(255,32,64,0.5)';ctx.lineWidth=1.5;ctx.setLineDash([3,3]);ctx.stroke();ctx.setLineDash([]);}
+      ctx.beginPath();ctx.arc(d.x,d.y,CONFIG.DEVICE_RADIUS,0,Math.PI*2);ctx.fillStyle=d.flagged?'rgba(255,32,64,0.15)':d.online?'rgba(0,229,160,0.15)':'rgba(85,91,110,0.15)';ctx.fill();ctx.strokeStyle=d.flagged?'#ff2040':d.online?'#00e5a0':'#555b6e';ctx.lineWidth=1.5;ctx.stroke();
+      if(d.online){const lc=DeviceModule.latClass(d.latency);const col=lc==='good'?'#00e5a0':lc==='ok'?'#ffd700':'#ff6b35';ctx.beginPath();ctx.arc(d.x,d.y,4,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();}
+      else{ctx.fillStyle='#555b6e';ctx.font='bold 9px Space Mono,monospace';ctx.textAlign='center';ctx.fillText('×',d.x,d.y+3);ctx.textAlign='left';}
+      const nl=sanitise(d.name);const nl2=nl.length>14?nl.substring(0,13)+'…':nl;ctx.font='9px Space Mono,monospace';const nw=ctx.measureText(nl2).width;ctx.fillStyle='rgba(10,12,16,.75)';ctx.fillRect(d.x-nw/2-3,d.y+13,nw+6,13);ctx.fillStyle=d.flagged?'#ff2040':d.online?'#00e5a0':'#555b6e';ctx.textAlign='center';ctx.fillText(nl2,d.x,d.y+23);
+      const ip=sanitise(d.ip);ctx.font='8px Space Mono,monospace';const iw=ctx.measureText(ip).width;ctx.fillStyle='rgba(10,12,16,.6)';ctx.fillRect(d.x-iw/2-2,d.y+26,iw+4,10);ctx.fillStyle='rgba(139,144,160,0.8)';ctx.fillText(ip,d.x,d.y+34);ctx.textAlign='left';
+      if(d.piholeHostname){ctx.beginPath();ctx.arc(d.x-11,d.y-11,3,0,Math.PI*2);ctx.fillStyle='rgba(204,34,34,0.8)';ctx.fill();}
+    });
+
+    /* ── Pi node markers — draggable, position saves on drop ── */
+    Object.values(State.piNodes).forEach(node => {
+      const isHov  = State.hoveredNodeLabel === node.label;
+      const isDrag = State.interaction.isDraggingNode && State.interaction.draggingNodeLabel === node.label;
+
+      if (!node.online && !node.placed) return;
+
+      if (node.placed && node.x !== undefined) {
+        // Placed node — draw at its canvas position
+        // Outer glow ring (stronger when hovered or dragging)
+        ctx.beginPath();ctx.arc(node.x,node.y,CONFIG.PI_NODE_RADIUS+4,0,Math.PI*2);
+        ctx.fillStyle=`rgba(0,119,255,${(isHov||isDrag)?.18:.08})`;ctx.fill();
+
+        // Main circle
+        ctx.beginPath();ctx.arc(node.x,node.y,CONFIG.PI_NODE_RADIUS,0,Math.PI*2);
+        ctx.fillStyle=isDrag?'rgba(0,119,255,0.4)':'rgba(0,119,255,0.2)';ctx.fill();
+        ctx.strokeStyle=isDrag?'#4da6ff':'rgba(0,119,255,0.7)';ctx.lineWidth=isDrag?2:1.5;ctx.stroke();
+
+        // Label inside
+        ctx.fillStyle='rgba(0,119,255,0.9)';ctx.font='bold 7px Space Mono,monospace';ctx.textAlign='center';
+        ctx.fillText(sanitise(node.label).substring(0,4),node.x,node.y+2);ctx.textAlign='left';
+
+        // Drag hint label
+        if(isHov&&!isDrag){
+          ctx.fillStyle='rgba(10,12,16,.85)';const hint='drag to move';const hw=ctx.measureText(hint).width;ctx.font='8px Space Mono,monospace';
+          ctx.fillRect(node.x-hw/2-4,node.y-26,hw+8,13);ctx.fillStyle='rgba(0,119,255,.9)';ctx.textAlign='center';ctx.fillText(hint,node.x,node.y-16);ctx.textAlign='left';
+        }
+      } else if (node.online && !node.placed) {
+        // Unplaced node — draw in bottom area of canvas as a "waiting to be placed" indicator
+        // The user needs to drag this onto the floor plan
+        const ix = State.canvasW - 60;
+        const iy = 20 + Object.values(State.piNodes).filter(n=>!n.placed&&n.online).indexOf(node) * 30;
+        ctx.beginPath();ctx.arc(ix,iy,8,0,Math.PI*2);
+        ctx.fillStyle='rgba(255,107,53,0.2)';ctx.fill();ctx.strokeStyle='rgba(255,107,53,0.6)';ctx.lineWidth=1.5;ctx.setLineDash([3,2]);ctx.stroke();ctx.setLineDash([]);
+        ctx.fillStyle='rgba(255,107,53,.8)';ctx.font='7px Space Mono,monospace';ctx.textAlign='center';ctx.fillText(sanitise(node.label).substring(0,4),ix,iy+2);
+        ctx.fillStyle='rgba(255,107,53,.6)';ctx.font='8px Space Mono,monospace';ctx.fillText('drag to place →',ix-50,iy+2);ctx.textAlign='left';
+      }
+    });
+  }
+
+  function render(dragPos) {
+    ctx.clearRect(0,0,State.canvasW,State.canvasH);ctx.save();ctx.translate(State.pan.x,State.pan.y);
+    if(document.getElementById('showGrid').checked){ctx.strokeStyle='rgba(255,255,255,0.033)';ctx.lineWidth=1;for(let x=0;x<State.canvasW+Math.abs(State.pan.x)+CONFIG.GRID_CELL;x+=CONFIG.GRID_CELL){ctx.beginPath();ctx.moveTo(x,-State.pan.y-CONFIG.GRID_CELL);ctx.lineTo(x,State.canvasH-State.pan.y+CONFIG.GRID_CELL);ctx.stroke();}for(let y=0;y<State.canvasH+Math.abs(State.pan.y)+CONFIG.GRID_CELL;y+=CONFIG.GRID_CELL){ctx.beginPath();ctx.moveTo(-State.pan.x-CONFIG.GRID_CELL,y);ctx.lineTo(State.canvasW-State.pan.x+CONFIG.GRID_CELL,y);ctx.stroke();}}
+    const ai=FloorModule.indexOf(State.activeFloorId);
+    State.floors.forEach((f,i)=>{if(f.id===State.activeFloorId||State.ghostVisibility[f.id]===false)return;drawFloor(f,State.display.ghostOpacity/Math.abs(i-ai),true);});
+    drawFloor(FloorModule.active(),State.display.heatmapOpacity,false);
+    drawDevices();
+    if(State.interaction.isDrawing&&dragPos&&State.interaction.tool==='draw'){const rect=normRect(State.interaction.drawStart,dragPos);ctx.strokeStyle='rgba(0,229,160,0.55)';ctx.lineWidth=1.5;ctx.setLineDash([5,4]);ctx.strokeRect(rect.x,rect.y,rect.w,rect.h);ctx.setLineDash([]);ctx.fillStyle='rgba(0,229,160,0.04)';ctx.fillRect(rect.x,rect.y,rect.w,rect.h);}
+    if(State.interaction.isDrawing&&dragPos&&State.interaction.tool==='zone'&&State.zoneDrawStart){const rect=normRect(State.zoneDrawStart,dragPos);const type=document.getElementById('zoneTypeInput').value;ctx.strokeStyle=ZoneModule.STROKES[type]||'rgba(255,107,53,0.6)';ctx.lineWidth=2;ctx.setLineDash([6,3]);ctx.strokeRect(rect.x,rect.y,rect.w,rect.h);ctx.setLineDash([]);ctx.fillStyle=ZoneModule.FILLS[type]||'rgba(255,107,53,0.08)';ctx.fillRect(rect.x,rect.y,rect.w,rect.h);ctx.fillStyle=ZoneModule.STROKES[type];ctx.font='9px Space Mono,monospace';ctx.fillText(sanitise(document.getElementById('zoneNameInput').value||type).toUpperCase().substring(0,20),rect.x+6,rect.y+14);}
+    ctx.restore();
+  }
+
+  function setTool(t){
+    State.interaction.tool=t;
+    ['draw','zone','ap','sensor','drag','pan'].forEach(id=>{document.getElementById('tool'+id.charAt(0).toUpperCase()+id.slice(1))?.classList.toggle('active',t===id);});
+    canvas.style.cursor=t==='pan'?'grab':'crosshair';
+    safeText(document.getElementById('overlayHint'),{draw:'Drag to draw rooms',zone:'Drag to draw security zone',ap:'Click to place AP',sensor:'Click to add reading',drag:'Drag device or Pi node markers',pan:'Drag to pan'}[t]||'');
+    document.getElementById('zoneDrawConfig').style.display=t==='zone'?'block':'none';
+  }
+
+  function deviceAtPos(pos){if(!document.getElementById('showDevices').checked)return null;const showOff=document.getElementById('showOffline').checked;for(const d of Object.values(State.devices)){if(d.floorId!==State.activeFloorId||(!d.online&&!showOff))continue;const dx=pos.x-d.x,dy=pos.y-d.y;if(Math.sqrt(dx*dx+dy*dy)<=CONFIG.DEVICE_HIT_RADIUS)return d;}return null;}
+
+  function resize(){State.canvasW=area.offsetWidth;State.canvasH=area.offsetHeight;canvas.width=State.canvasW;canvas.height=State.canvasH;render();}
+
+  // ── Mouse events ──────────────────────────────────────────────
+  canvas.addEventListener('mousedown', e => {
+    const pos = getPos(e);
+    const ix  = State.interaction;
+
+    if (ix.tool === 'pan') { ix.isPanning=true; ix.panStart={x:e.clientX-State.pan.x,y:e.clientY-State.pan.y}; canvas.style.cursor='grabbing'; return; }
+
+    if (ix.tool === 'drag') {
+      // Check Pi nodes first (smaller targets), then devices
+      const node = PiNodeModule.nodeAtPos(pos);
+      if (node) {
+        ix.isDraggingNode = true;
+        ix.draggingNodeLabel = node.label;
+        canvas.style.cursor = 'grabbing';
+        return;
+      }
+      const d = deviceAtPos(pos);
+      if (d) { ix.isDraggingDevice=true; ix.draggingDeviceId=d.id; ix.dragOffset={x:pos.x-d.x,y:pos.y-d.y}; d.pinned=true; canvas.style.cursor='grabbing'; }
+      return;
+    }
+
+    if (ix.tool === 'draw') { ix.isDrawing=true; ix.drawStart=pos; return; }
+    if (ix.tool === 'zone') { ix.isDrawing=true; State.zoneDrawStart=pos; return; }
+    if (ix.tool === 'ap')   { const f=FloorModule.active(); f.accessPoints.push({x:pos.x,y:pos.y,label:'AP'+(f.accessPoints.length+1)}); PersistModule.save(); render(); return; }
+    if (ix.tool === 'sensor') { const v=prompt('RSSI (e.g. -65):','-65'); if(v!==null){const n=parseInt(v);if(!isNaN(n))UIModule.addReading(pos.x,pos.y,n);} }
+  });
+
+  canvas.addEventListener('mousemove', e => {
+    const pos = getPos(e);
+    const ix  = State.interaction;
+    safeText(document.getElementById('overlayCoords'), `x:${Math.round(pos.x)} y:${Math.round(pos.y)}`);
+
+    if (ix.isPanning) { State.pan.x=e.clientX-ix.panStart.x; State.pan.y=e.clientY-ix.panStart.y; render(); return; }
+
+    // Pi node drag — update position in real time
+    if (ix.isDraggingNode && ix.draggingNodeLabel) {
+      const node = State.piNodes[ix.draggingNodeLabel];
+      if (node) { node.x=pos.x; node.y=pos.y; node.placed=true; render(); }
+      return;
+    }
+
+    if (ix.isDraggingDevice && ix.draggingDeviceId) { const d=State.devices[ix.draggingDeviceId]; if(d){d.x=pos.x-ix.dragOffset.x;d.y=pos.y-ix.dragOffset.y;render();}return; }
+    if (ix.isDrawing) { render(pos); return; }
+
+    // Hover detection — Pi nodes take priority
+    const hovNode = PiNodeModule.nodeAtPos(pos);
+    if (hovNode) {
+      State.hoveredNodeLabel  = hovNode.label;
+      State.hoveredDeviceId   = null;
+      hideTooltip();
+      canvas.style.cursor = ix.tool==='drag' ? 'grab' : 'pointer';
+      render();
+      return;
+    }
+
+    const hov = deviceAtPos(pos);
+    if (hov) { State.hoveredDeviceId=hov.id; State.hoveredNodeLabel=null; showTooltip(e,hov); canvas.style.cursor='pointer'; }
+    else { State.hoveredDeviceId=null; State.hoveredNodeLabel=null; hideTooltip(); if(ix.tool!=='drag')canvas.style.cursor=ix.tool==='pan'?'grab':'crosshair'; }
+    render();
+  });
+
+  canvas.addEventListener('mouseup', e => {
+    const ix = State.interaction;
+    if (ix.isPanning) { ix.isPanning=false; canvas.style.cursor='grab'; return; }
+
+    // Drag complete — persist position and notify scanner
+    if (ix.isDraggingNode && ix.draggingNodeLabel) {
+      const node = State.piNodes[ix.draggingNodeLabel];
+      if (node) PiNodeModule.placeNode(ix.draggingNodeLabel, node.x, node.y);
+      ix.isDraggingNode=false; ix.draggingNodeLabel=null; canvas.style.cursor='default';
+      return;
+    }
+
+    if (ix.isDraggingDevice) { ix.isDraggingDevice=false; ix.draggingDeviceId=null; PersistModule.save(); canvas.style.cursor='default'; return; }
+
+    if (ix.isDrawing) {
+      ix.isDrawing=false; const pos=getPos(e);
+      if(ix.tool==='draw'){const rect=normRect(ix.drawStart,pos);if(rect.w>15&&rect.h>15){const name=sanitise(document.getElementById('roomName').value)||'Room '+(FloorModule.active().rooms.length+1);FloorModule.active().rooms.push({...rect,name});UIModule.renderRoomList();PersistModule.save();}}
+      else if(ix.tool==='zone'){const rect=normRect(State.zoneDrawStart,pos);if(rect.w>20&&rect.h>20)ZoneModule.addZone(rect);State.zoneDrawStart=null;}
+      render();
+    }
+  });
+
+  canvas.addEventListener('mouseleave', () => { if(State.interaction.isDrawing){State.interaction.isDrawing=false;render();}State.hoveredDeviceId=null;State.hoveredNodeLabel=null;hideTooltip(); });
+
+  function showTooltip(e,d){
+    tooltip.className='map-tooltip visible'; tooltip.innerHTML='';
+    const nm=document.createElement('div');nm.className='tt-name';nm.textContent=sanitise(d.name)+(d.flagged?' ⚠':'');tooltip.appendChild(nm);
+    [['IP',sanitise(d.ip),'var(--accent2)'],['MAC',sanitise(d.mac),null],['Vendor',sanitise(d.vendor),null],d.piholeHostname?['Pi-hole',sanitise(d.piholeHostname),'var(--pihole)']:null,d.trilat?['Pos',`${sanitise(d.trilat.method)} (${d.trilat.nodeCount})`,null]:null,d.riskScore>5?['Risk',`${Math.round(d.riskScore)}/100`,d.riskScore>=60?'var(--critical)':'var(--warn)']:null].filter(Boolean).forEach(([lbl,val,color])=>{const row=document.createElement('div');row.className='tt-row';const l=document.createElement('span');l.style.color='var(--text3)';l.textContent=lbl;const v=document.createElement('span');if(color)v.style.color=color;v.textContent=val;row.append(l,v);tooltip.appendChild(row);});
+    const hint=document.createElement('div');hint.style.cssText='margin-top:3px;font-size:8px;color:var(--text3)';hint.textContent=d.pinned?'⬤ Pinned':'Use Drag tool to reposition';tooltip.appendChild(hint);
+    const r=canvas.getBoundingClientRect();tooltip.style.left=Math.min(e.clientX-r.left+14,State.canvasW-165)+'px';tooltip.style.top=Math.max(e.clientY-r.top-10,5)+'px';
+  }
+  function hideTooltip(){tooltip.className='map-tooltip';}
+
+  window.addEventListener('resize',resize);
+  let _renderErrors = 0;
+  function rafLoop(){
+    if(State.dirty){
+      try{
+        render();
+        _renderErrors = 0;
+      }catch(e){
+        Logger.error('CanvasModule.render:',e);
+        _renderErrors++;
+        State.dirty = false;
+        if(_renderErrors === 1){
+          // Show non-blocking banner — auto-dismisses after 8s
+          const b = document.getElementById('renderErrorBanner');
+          if(b){ b.classList.add('visible'); setTimeout(()=>b.classList.remove('visible'), 8000); }
+        }
+        if(_renderErrors < 5){
+          // Auto-recovery: retry next frame after a brief pause
+          setTimeout(()=>{ State.dirty=true; }, 1000);
+        }
+      }
+      State.dirty=false;
+    }
+    requestAnimationFrame(rafLoop);
+  }
+  requestAnimationFrame(rafLoop);
+
+  return{render,resize,setTool,rssiClass};
+})();
+
+
+/* ============================================================
+   WEBSOCKET MODULE
+   ============================================================ */
+const WSModule = (() => {
+  function connect(){
+    if(!AuthModule.isAuthed()){Logger.warn('WSModule: not authenticated');return;}
+    const host=sanitise(document.getElementById('wsHost').value.trim()).replace(/[^a-zA-Z0-9.\-:]/g,'');
+    const port=parseInt(sanitise(document.getElementById('wsPort').value.trim()))||8765;
+    State.wsHost=host; State.wsPort=port; PersistModule.save();
+    if(State.ws)State.ws.close();
+    const token=AuthModule.getToken();
+    const proto=token?[`wifimap-v${CONFIG.WS_VERSION}`,`auth-${token.substring(0,16)}`]:[`wifimap-v${CONFIG.WS_VERSION}`];
+    try{State.ws=new WebSocket(`ws://${host}:${port}`,proto);}catch(e){Logger.error('WSModule: invalid URL',e);setStatus('error');return;}
+    State.ws.onopen  = () => { setStatus('connected'); PiholeModule.start(host); };
+    State.ws.onmessage=e => handleMessage(e.data);
+    State.ws.onerror = () => setStatus('error');
+    State.ws.onclose = () => { setStatus('disconnected'); PiholeModule.stop(); };
+  }
+  function disconnect(){if(State.ws){State.ws.close();State.ws=null;}setStatus('disconnected');PiholeModule.stop();}
+
+  function send(obj){
+    if(State.ws?.readyState===1){
+      try{State.ws.send(JSON.stringify({...obj,version:CONFIG.WS_VERSION}));}
+      catch(e){Logger.warn('WSModule.send failed',e.message);}
+    }
+  }
+
+  /** Send zone definition to scanner — persisted to zones.json on Pi. */
+  function sendZone(zone, action='add') {
+    send({
+      type:   'zone_save',
+      action,
+      zone: {
+        id:         zone.id,
+        name:       sanitise(zone.name),
+        type:       sanitise(zone.type),
+        alertTier:  sanitise(zone.alertTier),
+        x: zone.x, y: zone.y, w: zone.w, h: zone.h,
+        floorId:    zone.floorId,
+        schedule:   zone.schedule,
+        allowedMacs: [...(zone.allowedMacs||[])],
+      },
+    });
+  }
+
+  /** Send zone delete to scanner. */
+  function sendZoneDelete(id) { send({ type:'zone_delete', id }); }
+
+  /** Send device approval to scanner — written to SQLite approved_devices table. */
+  function sendDeviceApproval(mac) { send({ type:'device_approve', mac: sanitise(mac) }); }
+
+  /** Send Pi node canvas position to scanner — saved to pi_nodes table. */
+  function sendNodePosition(label, normX, normY) {
+    send({ type:'node_position', label:sanitise(label), x:normX, y:normY });
+  }
+
+  function handleMessage(raw){
+    let data;
+    try{data=JSON.parse(raw);}catch(e){Logger.warn('WSModule: invalid JSON');return;}
+
+    if(data.version!==undefined&&data.version!==CONFIG.WS_VERSION){
+      Logger.warn(`WSModule: version mismatch client=${CONFIG.WS_VERSION} scanner=${data.version}`);
+      document.getElementById('versionBanner').classList.add('visible');
+    }else{document.getElementById('versionBanner').classList.remove('visible');}
+
+    safeText(document.getElementById('lastUpdate'),new Date().toLocaleTimeString());
+    const type=sanitise(data.type||(data.rssi!==undefined?'rssi':data.mac!==undefined?'device':'unknown'));
+
+    switch(type){
+      case 'hello':
+        State.scannerVersion=data.version;
+        PiNodeModule.register(sanitiseFields(data,['label']));
+        break;
+      case 'rssi':
+        UIModule.addReading(data.x!==undefined?data.x*State.canvasW-State.pan.x:State.canvasW*.5,data.y!==undefined?data.y*State.canvasH-State.pan.y:State.canvasH*.5,parseInt(data.rssi)||0,sanitise(data.label||data.ssid));
+        break;
+      case 'device':
+        DeviceModule.upsert({mac:data.mac,ip:data.ip,vendor:data.vendor,online:data.online,latency:data.latency,piX:data.x!==undefined?data.x*State.canvasW-State.pan.x:undefined,piY:data.y!==undefined?data.y*State.canvasH-State.pan.y:undefined,pi_label:data.pi_label});
+        if(data.online&&data.mac&&data.pi_label&&data.rssi!==undefined)PiNodeModule.updateDeviceSignal(sanitise(data.pi_label),sanitise(data.mac),parseInt(data.rssi)||0);
+        break;
+      case 'device_rssi':
+        if(data.pi_label&&Array.isArray(data.devices)){if(!State.piNodes[sanitise(data.pi_label)])PiNodeModule.register({label:data.pi_label,x:data.x,y:data.y});data.devices.forEach(e=>{if(e.mac&&e.rssi!==undefined)PiNodeModule.updateDeviceSignal(sanitise(data.pi_label),sanitise(e.mac),parseInt(e.rssi)||0);});}
+        break;
+      case 'rogue_ap':
+        SecurityModule.checkAP(sanitiseFields({bssid:data.bssid,ssid:data.ssid,rssi:data.rssi,piLabel:data.pi_label},['bssid','ssid','piLabel']));
+        break;
+      case 'deauth_attack':
+        SecurityModule.fireEvent({severity:'critical',type:'deauth_attack',title:'Deauthentication attack detected',description:`${sanitise(String(data.count))} deauth frames in ${sanitise(String(data.window))}s`,location:`Pi: ${sanitise(data.pi_label||'?')}`});
+        break;
+      case 'mac_spoof':
+        SecurityModule.checkMACSpoof(sanitise(data.ip),sanitise(data.old_mac),sanitise(data.new_mac));
+        break;
+
+      // ── Persistence inbound message types ────────────────────
+      case 'zone_load':
+        // Scanner sends all persisted zones on connect
+        if(Array.isArray(data.zones)) ZoneModule.loadFromScanner(data.zones);
+        break;
+      case 'event_replay':
+        // Scanner sends last N events on connect — populate the event log
+        if(Array.isArray(data.events)) AlertModule.loadReplay(data.events);
+        break;
+      case 'approved_devices':
+        // Scanner sends the approved device list on connect
+        if(Array.isArray(data.devices)) DeviceModule.loadApprovedFromScanner(data.devices);
+        break;
+
+      default:
+        Logger.debug('WSModule: unknown type:',type);
+    }
+  }
+
+  function setStatus(s){const dot=document.getElementById('wsDot');const lbl=document.getElementById('wsStatus');dot.className='pill-dot'+(s==='connected'?' on':s==='error'?' err':'');safeText(lbl,s);}
+
+  /** MSP mode: use the aggWs as a proxied transport for a specific site. */
+  function connectViaProxy(aggWs, siteId) {
+    if (State.ws) State.ws.close();
+    // Wrap aggWs — only forward messages for this siteId
+    // The aggregation server already filters; we just wire the handlers
+    State.ws = aggWs;
+    setStatus(`connected → ${sanitise(siteId)}`);
+    safeText(document.getElementById('canvasFloorBadge'), sanitise(siteId).toUpperCase());
+    Logger.info(`WSModule: proxied to ${siteId} via aggregation server`);
+    // Clear existing device/reading state before populating from new site
+    State.devices = {}; State.piNodes = {}; State.activeAlerts = [];
+    State.eventLog = []; State.totalReadings = 0;
+    State.floors.forEach(f => { f.readings = []; });
+    DeviceModule.updateCounts(); AlertModule.render();
+    safeText(document.getElementById('readingCount'), 0);
+    State.dirty = true;
+  }
+
+  /** MSP mode: called by SiteRegistry when a message arrives on aggWs while drilling. */
+  function handleProxiedMessage(raw) { handleMessage(raw); }
+
+  return{connect,disconnect,send,sendZone,sendZoneDelete,sendDeviceApproval,sendNodePosition,connectViaProxy,handleProxiedMessage};
+})();
+
+
+/* ============================================================
+   UI MODULE
+   ============================================================ */
+const UIModule = (() => {
+  function addReading(x,y,rssi,label){
+    const floor=FloorModule.active();floor.readings.push({x,y,rssi,timestamp:Date.now(),label:sanitise(label)});
+    if(floor.readings.length>CONFIG.MAX_READINGS_PER_FLOOR)floor.readings.splice(0,floor.readings.length-CONFIG.MAX_READINGS_PER_FLOOR);
+    State.totalReadings++;safeText(document.getElementById('readingCount'),State.totalReadings);
+    updateReadingList(rssi,sanitise(label));updateStats();FloorModule.renderTabs();State.dirty=true;
+    // Don't save on every reading — too frequent. Readings are ephemeral.
+  }
+  function updateReadingList(rssi,label){
+    const list=document.getElementById('readingList');const t=new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    const item=document.createElement('div');item.className='reading-item';
+    const lbl=document.createElement('span');lbl.style.color='var(--text3)';lbl.textContent=sanitise(label)||t;
+    const val=document.createElement('span');val.className=`reading-val ${CanvasModule.rssiClass(rssi)}`;val.textContent=`${rssi} dBm`;
+    item.append(lbl,val);list.insertBefore(item,list.firstChild);while(list.children.length>CONFIG.MAX_READING_LIST)list.removeChild(list.lastChild);
+  }
+  function updateStats(){
+    const vals=FloorModule.active().readings.map(r=>r.rssi);
+    if(!vals.length){['statBest','statWorst','statAvg'].forEach(id=>safeText(document.getElementById(id),'—'));safeText(document.getElementById('statPoints'),0);return;}
+    safeText(document.getElementById('statBest'),Math.max(...vals)+' dB');safeText(document.getElementById('statWorst'),Math.min(...vals)+' dB');safeText(document.getElementById('statAvg'),Math.round(vals.reduce((a,b)=>a+b,0)/vals.length)+' dB');safeText(document.getElementById('statPoints'),vals.length);
+  }
+  function renderRoomList(){
+    const f=FloorModule.active();safeText(document.getElementById('roomCount'),f.rooms.length);const list=document.getElementById('roomList');list.innerHTML='';
+    f.rooms.forEach((r,i)=>{const item=document.createElement('div');item.className='room-list-item';const nm=document.createElement('span');nm.textContent=sanitise(r.name);const del=document.createElement('button');del.className='room-delete';del.textContent='×';del.onclick=()=>{f.rooms.splice(i,1);renderRoomList();PersistModule.save();State.dirty=true;};item.append(nm,del);list.appendChild(item);});
+  }
+  function syncFloorName(){document.getElementById('floorNameEdit').value=sanitise(FloorModule.active().name);}
+  return{addReading,updateStats,renderRoomList,syncFloorName};
+})();
+
+
+/* ============================================================
+   SITE REGISTRY MODULE — MSP multi-site overview
+   ============================================================
+   Manages the persistent WebSocket connection to the aggregation
+   server and the MSP overview UI. Completely independent of State
+   and the existing single-site dashboard — the two never mix.
+
+   State flow:
+   - aggWs opens on connect() and stays open permanently
+   - site_list received on connect → renders all site cards
+   - site_status pushed on any change → updates the relevant card
+   - drill_in sent when operator clicks a site card
+   - drill_active received → WSModule.connectViaProxy() called
+   - drill_out sent when operator clicks ← Single Site View
+   - drill_out also sent implicitly if aggWs closes
+
+   Persistence: aggUrl saved in localStorage via PersistModule.
+   Sites list kept in SiteRegistry._sites (not in State).
+   ============================================================ */
+const SiteRegistry = (() => {
+  let _aggWs   = null;
+  let _sites   = {};     // siteId → site summary object
+  let _drilling = null;  // siteId currently drilled into, or null
+  let _mspOpen  = false;
+
+  // ── Connection ──────────────────────────────────────────────
+  function connect() {
+    const url = sanitise(document.getElementById('aggUrl')?.value.trim() || '');
+    if (!url) { Logger.warn('SiteRegistry: no aggregation server URL'); return; }
+    State.aggUrl = url;
+    PersistModule.save();
+
+    if (_aggWs) { _aggWs.close(); _aggWs = null; }
+
+    try {
+      _aggWs = new WebSocket(url);
+    } catch(e) {
+      Logger.error('SiteRegistry: invalid URL', e);
+      setAggStatus('error');
+      return;
+    }
+
+    _aggWs.onopen  = () => {
+      Logger.info('SiteRegistry: connected to aggregation server');
+      setAggStatus('connected');
+    };
+    _aggWs.onmessage = e => _handleMessage(e.data);
+    _aggWs.onerror   = () => setAggStatus('error');
+    _aggWs.onclose   = () => {
+      setAggStatus('disconnected');
+      // If drilling, notify dashboard the connection was lost
+      if (_drilling) {
+        WSModule.disconnect();
+        _drilling = null;
+      }
+      // Retry after 5s
+      setTimeout(() => { if (State.aggUrl) connect(); }, 5000);
+    };
+  }
+
+  function disconnect() {
+    if (_aggWs) { _aggWs.close(); _aggWs = null; }
+    setAggStatus('disconnected');
+  }
+
+  // ── Message handling ─────────────────────────────────────────
+  function _handleMessage(raw) {
+    let data;
+    try { data = JSON.parse(raw); } catch(e) { return; }
+
+    const type = sanitise(data.type || '');
+
+    if (type === 'site_list') {
+      // Full site list on connect
+      _sites = {};
+      (data.sites || []).forEach(s => { _sites[sanitise(s.siteId || s.label || '')] = s; });
+      _renderGrid();
+      _updateMspBadge();
+    }
+
+    else if (type === 'site_status') {
+      // Incremental push when a site changes
+      const id = sanitise(data.siteId || '');
+      if (!id) return;
+      _sites[id] = { ..._sites[id], ...data };
+      _updateCard(id);
+      _updateMspBadge();
+    }
+
+    else if (type === 'drill_active') {
+      // Aggregation server confirmed proxy is active
+      const id = sanitise(data.siteId || '');
+      _drilling = id;
+      _removeDrillingOverlay(id);
+      Logger.info(`SiteRegistry: drill active → ${id}`);
+      // Tell WSModule to use the aggWs as the transport for this site
+      WSModule.connectViaProxy(_aggWs, id);
+      // Switch to single-site view so operator can use the full dashboard
+      hideMSP();
+    }
+
+    else if (type === 'site_error') {
+      const id = sanitise(data.siteId || '');
+      _removeDrillingOverlay(id);
+      Logger.warn(`SiteRegistry: site error for ${id}: ${sanitise(data.reason || '')}`);
+    }
+
+    // While drilling, forward all other messages to WSModule
+    else if (_drilling) {
+      WSModule.handleProxiedMessage(raw);
+    }
+  }
+
+  // ── Drill in / out ───────────────────────────────────────────
+  function drillIn(siteId) {
+    const id = sanitise(siteId);
+    if (!_aggWs || _aggWs.readyState !== 1) {
+      Logger.warn('SiteRegistry: not connected to aggregation server');
+      return;
+    }
+    // Show drilling overlay on the card
+    _showDrillingOverlay(id);
+    // Send drill_in to aggregation server
+    _aggWs.send(JSON.stringify({ type: 'drill_in', siteId: id }));
+    Logger.info(`SiteRegistry: drilling into ${id}`);
+  }
+
+  function drillOut() {
+    if (_aggWs?.readyState === 1 && _drilling) {
+      _aggWs.send(JSON.stringify({ type: 'drill_out' }));
+    }
+    _drilling = null;
+    WSModule.disconnect();
+    showMSP();
+  }
+
+  // ── MSP overlay show/hide ────────────────────────────────────
+  function showMSP() {
+    _mspOpen = true;
+    document.getElementById('mspOverlay').classList.add('visible');
+    _renderGrid();
+    // If aggUrl is configured but not connected, auto-connect
+    if (State.aggUrl && (!_aggWs || _aggWs.readyState > 1)) connect();
+  }
+
+  function hideMSP() {
+    _mspOpen = false;
+    document.getElementById('mspOverlay').classList.remove('visible');
+  }
+
+  // ── Grid rendering ────────────────────────────────────────────
+  function _renderGrid() {
+    const grid = document.getElementById('mspSiteGrid');
+    const sites = Object.values(_sites);
+    safeText(document.getElementById('aggSiteCount'), sites.length);
+
+    if (!sites.length) {
+      grid.innerHTML = '<div class="msp-empty"><div class="msp-empty-icon">◎</div>No sites connected.<br>Pi scanners connect automatically when online.</div>';
+      return;
+    }
+
+    grid.innerHTML = '';
+    sites.sort((a,b) => {
+      // Alerts first, then online, then offline alphabetically
+      const aScore = (a.alertCount||0)*100 + (a.status==='online'?10:0);
+      const bScore = (b.alertCount||0)*100 + (b.status==='online'?10:0);
+      return bScore - aScore || sanitise(a.label||'').localeCompare(sanitise(b.label||''));
+    }).forEach(site => grid.appendChild(_buildCard(site)));
+  }
+
+  function _buildCard(site) {
+    const id       = sanitise(site.siteId || site.label || '');
+    const label    = sanitise(site.label  || id);
+    const status   = sanitise(site.status || 'offline');
+    const alerts   = parseInt(site.alertCount)  || 0;
+    const devices  = parseInt(site.deviceCount) || 0;
+    const cardClass = alerts > 0 ? 'alert' : status;
+    const dotClass  = alerts > 0 ? 'alert' : status;
+
+    const card = document.createElement('div');
+    card.className = `site-card ${cardClass}`;
+    card.id = `site-card-${id}`;
+    card.onclick = () => { if (status === 'online') drillIn(id); };
+
+    const top = document.createElement('div'); top.className = 'site-card-top';
+    const dot = document.createElement('div'); dot.className = `site-status-dot ${dotClass}`;
+    const nm  = document.createElement('div'); nm.className  = 'site-name'; nm.textContent = label;
+    const arr = document.createElement('div'); arr.className = 'site-drill-arrow';
+    arr.textContent = status === 'online' ? '→' : '—';
+    top.append(dot, nm, arr);
+
+    const stats = document.createElement('div'); stats.className = 'site-stats';
+
+    const dStat = document.createElement('div'); dStat.className = 'site-stat';
+    const dVal  = document.createElement('div'); dVal.className  = `site-stat-val ${devices>0?'has-devices':''}`;
+    dVal.textContent = devices;
+    const dLbl  = document.createElement('div'); dLbl.className  = 'site-stat-label'; dLbl.textContent = 'Devices';
+    dStat.append(dVal, dLbl);
+
+    const aStat = document.createElement('div'); aStat.className = 'site-stat';
+    const aVal  = document.createElement('div'); aVal.className  = `site-stat-val ${alerts>0?'has-alerts':''}`;
+    aVal.textContent = alerts;
+    const aLbl  = document.createElement('div'); aLbl.className  = 'site-stat-label'; aLbl.textContent = 'Alerts';
+    aStat.append(aVal, aLbl);
+
+    stats.append(dStat, aStat);
+
+    const lastEvt = document.createElement('div');
+    lastEvt.className = 'site-last-event';
+    if (site.lastEvent) {
+      const sev = sanitise(site.lastEvent.severity || 'info');
+      lastEvt.className += ` ${sev}`;
+      const ago = _timeAgo(site.lastEvent.ts);
+      lastEvt.textContent = `${sanitise(site.lastEvent.title || '')} · ${ago}`;
+    } else {
+      lastEvt.textContent = status === 'online' ? 'No alerts' : 'Offline';
+    }
+
+    card.append(top, stats, lastEvt);
+    return card;
+  }
+
+  function _updateCard(id) {
+    const site = _sites[id]; if (!site) return;
+    const existing = document.getElementById(`site-card-${id}`);
+    if (!existing) { _renderGrid(); return; } // card not rendered yet
+    const newCard = _buildCard(site);
+    existing.replaceWith(newCard);
+  }
+
+  function _showDrillingOverlay(id) {
+    const card = document.getElementById(`site-card-${id}`); if (!card) return;
+    const ov = document.createElement('div'); ov.className = 'msp-drilling'; ov.textContent = 'Connecting…';
+    card.appendChild(ov);
+  }
+
+  function _removeDrillingOverlay(id) {
+    const card = document.getElementById(`site-card-${id}`); if (!card) return;
+    card.querySelectorAll('.msp-drilling').forEach(el => el.remove());
+  }
+
+  function _updateMspBadge() {
+    const total = Object.values(_sites).reduce((sum, s) => sum + (parseInt(s.alertCount)||0), 0);
+    const badge = document.getElementById('mspAlertBadge');
+    if (badge) {
+      badge.style.display = total > 0 ? 'inline' : 'none';
+      safeText(badge, `${total} alert${total!==1?'s':''}`);
+    }
+  }
+
+  function _timeAgo(ts) {
+    if (!ts) return '';
+    const s = Math.floor((Date.now() - ts) / 1000);
+    if (s < 5)   return 'just now';
+    if (s < 60)  return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s/60)}m ago`;
+    return `${Math.floor(s/3600)}h ago`;
+  }
+
+  // ── Status indicator ─────────────────────────────────────────
+  function setAggStatus(s) {
+    const dots = [document.getElementById('aggDot'), document.getElementById('aggDotHdr')];
+    const lbl  = document.getElementById('aggStatus');
+    const lbl2 = document.getElementById('aggStatusHdr');
+    dots.forEach(d => { if(d) d.className = 'pill-dot' + (s==='connected'?' on':s==='error'?' err':''); });
+    if (lbl)  safeText(lbl,  s);
+    if (lbl2) safeText(lbl2, s==='connected'?'MSP ●':'MSP');
+    if (lbl2) lbl2.style.color = s==='connected'?'var(--accent)':s==='error'?'var(--warn)':'var(--text3)';
+  }
+
+  // ── Init ─────────────────────────────────────────────────────
+  function init() {
+    // Auto-connect if URL was persisted
+    if (State.aggUrl) {
+      const el = document.getElementById('aggUrl');
+      if (el) el.value = State.aggUrl;
+      connect();
+    }
+  }
+
+  return { connect, disconnect, drillIn, drillOut, showMSP, hideMSP, init, setAggStatus };
+})();
+
+
+/* ============================================================
+   APP
+   ============================================================ */
+const App = (() => {
+  function exportJSON(){
+    const data={version:'5.2',exported:new Date().toISOString(),floors:State.floors.map(f=>({...f,zones:(f.zones||[]).map(z=>({...z,allowedMacs:[...(z.allowedMacs||[])],activeAlerts:[]}))})),devices:State.devices,piNodes:State.piNodes,approvedDevices:State.approvedDevices,eventLog:State.eventLog};
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`wifi-map-${Date.now()}.json`;a.click();
+  }
+  function exportPDF(){
+    // Export JSON then instruct user to run generate_report.py
+    // In a Pi deployment the dashboard can POST to a local endpoint;
+    // in standalone mode we export JSON and show instructions.
+    const data={version:'5.3',exported:new Date().toISOString(),
+      siteName: sanitise(FloorModule.active().name) || 'WiFi/MAP Site',
+      floors:State.floors.map(f=>({...f,zones:(f.zones||[]).map(z=>({...z,allowedMacs:[...(z.allowedMacs||[])],activeAlerts:[]}))})),
+      devices:State.devices,piNodes:State.piNodes,
+      approvedDevices:State.approvedDevices,eventLog:State.eventLog};
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+    const a=document.createElement('a');
+    const fname=`wifi-map-${Date.now()}.json`;
+    a.href=URL.createObjectURL(blob); a.download=fname; a.click();
+    setTimeout(()=>{
+      alert(`JSON exported as "${fname}".\n\nGenerate PDF report:\n  python3 generate_report.py ${fname} --site "Site Name" --period "Month Year"\n\nRequires: pip3 install weasyprint --break-system-packages`);
+    },300);
+  }const a=document.createElement('a');a.href=document.getElementById('floorCanvas').toDataURL('image/png');a.download=`wifi-map-${Date.now()}.png`;a.click();}
+
+  function importJSON(){
+    const input=document.createElement('input');input.type='file';input.accept='.json';
+    input.onchange=e=>{
+      const file=e.target.files[0];if(!file)return;
+      const reader=new FileReader();
+      reader.onload=ev=>{
+        try{
+          const data=JSON.parse(ev.target.result);
+          if(data.floors){
+            State.floors=data.floors.map(f=>({...f,zones:(f.zones||[]).map(z=>({...z,allowedMacs:new Set(z.allowedMacs||[]),activeAlerts:new Set()}))}));
+            State.activeFloorId=State.floors[0].id;
+          }
+          if(data.approvedDevices)State.approvedDevices=data.approvedDevices;
+          if(data.eventLog)State.eventLog=data.eventLog;
+          if(data.piNodes){
+            Object.entries(data.piNodes).forEach(([label,node])=>{
+              if(node.placed){State.piNodes[label]={...node,rssiTable:{}};
+              }
+            });
+          }
+          PersistModule.save();FloorModule.renderTabs();UIModule.syncFloorName();UIModule.renderRoomList();ZoneModule.renderZoneList();AlertModule.render();PiNodeModule.renderNodeList();State.dirty=true;
+          alert('Floor plan imported successfully.');
+        }catch(e){alert('Import failed — invalid JSON file.');}
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  }
+
+  function seedDemo(){
+    Logger.info('App.seedDemo v5.3');
+    const W=State.canvasW,H=State.canvasH;
+    [{x:.2,y:.3,rssi:-44,l:'entry'},{x:.5,y:.45,rssi:-57,l:'center'},{x:.75,y:.6,rssi:-72,l:'far'},{x:.3,y:.7,rssi:-64,l:'kitchen'}].forEach(d=>UIModule.addReading(d.x*W,d.y*H,d.rssi,d.l));
+    FloorModule.active().accessPoints.push({x:W*.22,y:H*.28,label:'AP1'});
+    FloorModule.active().rooms.push({x:W*.05,y:H*.05,w:W*.3,h:H*.35,name:'Living Room'},{x:W*.4,y:H*.05,w:W*.55,h:H*.35,name:'Kitchen'},{x:W*.05,y:H*.5,w:W*.9,h:H*.45,name:'Master Bedroom'});
+    FloorModule.active().zones.push({id:1,name:'Server Room',floorId:0,x:W*.42,y:H*.06,w:W*.25,h:H*.32,type:'restricted',alertTier:'critical',schedule:{always:true,hours:{start:'00:00',end:'23:59'},days:[0,1,2,3,4,5,6]},allowedMacs:new Set(),activeAlerts:new Set(),lastPulse:0},{id:2,name:'Entry Zone',floorId:0,x:W*.05,y:H*.06,w:W*.28,h:H*.32,type:'monitored',alertTier:'warning',schedule:{always:false,hours:{start:'18:00',end:'07:00'},days:[0,1,2,3,4,5,6]},allowedMacs:new Set(),activeAlerts:new Set(),lastPulse:0});
+
+    // Seed Pi nodes with placed positions so trilateration works in demo
+    [{label:'pi-node-1',x:W*.15,y:H*.20},{label:'pi-node-2',x:W*.80,y:H*.25},{label:'pi-node-3',x:W*.50,y:H*.80}].forEach(n=>{
+      State.piNodes[n.label]={label:n.label,x:n.x,y:n.y,placed:true,online:true,demo:true,lastSeen:Date.now(),rssiTable:{}};
+    });
+
+    State.approvedDevices['b8:27:eb:aa:11:22']={approved:true,approvedAt:Date.now()};State.approvedDevices['28:cd:c1:bb:33:44']={approved:true,approvedAt:Date.now()};State.approvedDevices['44:85:00:cc:55:66']={approved:true,approvedAt:Date.now()};State.approvedDevices['94:35:0a:ee:99:aa']={approved:true,approvedAt:Date.now()};
+
+    [{mac:'b8:27:eb:aa:11:22',ip:'192.168.1.10',on:true,lat:4,ph:'living-room-pi',x:.22,y:.28},{mac:'28:cd:c1:bb:33:44',ip:'192.168.1.42',on:true,lat:12,ph:'johns-iphone',x:.50,y:.50},{mac:'44:85:00:cc:55:66',ip:'192.168.1.55',on:true,lat:38,ph:'echo-kitchen',x:.75,y:.35},{mac:'00:17:88:dd:77:88',ip:'192.168.1.71',on:false,lat:null,ph:null,x:.30,y:.70},{mac:'94:35:0a:ee:99:aa',ip:'192.168.1.88',on:true,lat:67,ph:'samsung-tv',x:.60,y:.65},{mac:'dc:a6:32:ff:ee:dd',ip:'192.168.1.199',on:true,lat:22,ph:null,x:.68,y:.15}].forEach(d=>{
+      DeviceModule.upsert({mac:d.mac,ip:d.ip,online:d.on,latency:d.lat,piX:d.x*W,piY:d.y*H});
+      const dev=State.devices[d.mac];if(dev&&d.ph){dev.piholeHostname=d.ph;dev.name=d.ph;}
+      if(dev&&d.on){[{label:'pi-node-1',x:.15,y:.20},{label:'pi-node-2',x:.80,y:.25},{label:'pi-node-3',x:.50,y:.80}].forEach(node=>{const dx=d.x-node.x,dy=d.y-node.y;const rssi=Math.max(-90,Math.min(-30,Math.round(-50-Math.sqrt(dx*dx+dy*dy)*60+Math.random()*6-3)));PiNodeModule.updateDeviceSignal(node.label,d.mac,rssi);});for(let i=0;i<8;i++){const t=1-i/8;TrailModule.record(d.mac,dev.x+(Math.random()-.5)*20*t,dev.y+(Math.random()-.5)*20*t);}}
+    });
+
+    document.getElementById('piholeDot').className='pill-dot ph';safeText(document.getElementById('piholeCount'),'8 names');
+
+    setTimeout(()=>{
+      SecurityModule.fireEvent({severity:'warning',type:'zone_schedule',title:'Device in monitored zone after hours',description:'johns-iphone entered Entry Zone at 22:14 outside permitted hours',device:State.devices['28:cd:c1:bb:33:44'],zone:FloorModule.active().zones[1],location:'Entry Zone'});
+      SecurityModule.fireEvent({severity:'info',type:'device_joined',title:'Known device joined network',description:'samsung-tv (192.168.1.88) reconnected',device:State.devices['94:35:0a:ee:99:aa'],location:'Network'});
+    },800);
+
+    TrilaterationModule.updateAll();UIModule.renderRoomList();ZoneModule.renderZoneList();PiNodeModule.renderNodeList();FloorModule.renderTabs();
+
+    FloorModule.add();[{x:.35,y:.35,rssi:-61,l:'hall'},{x:.65,y:.55,rssi:-79,l:'master'},{x:.20,y:.60,rssi:-68,l:'bath'}].forEach(d=>UIModule.addReading(d.x*State.canvasW,d.y*State.canvasH,d.rssi,d.l));
+    FloorModule.switchTo(State.floors[0].id);
+
+    // Save the demo state to localStorage
+    PersistModule.save();
+    Logger.info('App.seedDemo v5.3: complete');
+  }
+
+  function init(){
+    Logger.info('App.init: WiFi/MAP v5.3');
+
+    // Load persisted state BEFORE rendering — order is critical
+    const hadSavedData = PersistModule.load();
+
+    // Auth check
+    if (!AuthModule.checkExistingSession()) {
+      Logger.info('App.init: showing auth overlay');
+    }
+
+    FloorModule.renderTabs();
+    UIModule.syncFloorName();
+    CanvasModule.resize();
+
+    // Apply saved preferences to DOM elements
+    PersistModule.restorePrefsToDOM();
+    PersistModule.restoreNtfyToDOM();
+    PersistModule.restoreConnectionToDOM();
+
+    // Render restored state
+    UIModule.renderRoomList();
+    ZoneModule.renderZoneList();
+    PiNodeModule.renderNodeList();
+    AlertModule.render();
+    SiteRegistry.init();
+
+    if (hadSavedData) {
+      // Show the restore banner briefly
+      document.getElementById('persistBanner').classList.add('visible');
+      Logger.info('App.init: state restored from localStorage');
+    } else {
+      // No saved state — seed demo
+      setTimeout(seedDemo, 200);
+    }
+  }
+
+  return{init,exportJSON,exportPDF,exportPNG,importJSON};
+})();
+
+if (typeof module === 'undefined') App.init();
+</script>
+</body>
+</html>

@@ -1,0 +1,94 @@
+# WiFi/MAP v5.3 — Docker Compose
+# ============================================================
+# MSP central deployment: dashboard + notification bridge + aggregation server.
+# The Pi scanner at each client site runs via systemd (needs WiFi hardware).
+#
+# QUICK START
+#   1. Copy this file and the wifimap package to your server
+#   2. Set environment variables below (or use a .env file)
+#   3. docker-compose up -d
+#   4. Open http://localhost:8080
+#
+# TAILSCALE (recommended for MSP deployments)
+#   Install Tailscale on this machine: curl -fsSL https://tailscale.com/install.sh | sh
+#   Then: sudo tailscale up --authkey=tskey-auth-XXXXXXXXXXXX
+#   Client Pi scanners point WIFIMAP_UPSTREAM at this machine's Tailscale IP:
+#     WIFIMAP_UPSTREAM=ws://100.64.0.2:8766
+#
+# ENVIRONMENT VARIABLES
+#   Copy .env.example to .env and fill in your values.
+#   Or set them inline below.
+# ============================================================
+
+version: '3.8'
+
+services:
+
+  # ── Dashboard ────────────────────────────────────────────────
+  # Serves the WiFi/MAP single-page app via nginx.
+  # Open http://localhost:8080 (or your Tailscale IP).
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - wifimap
+
+  # ── Aggregation server ────────────────────────────────────────
+  # Accepts outbound WebSocket connections from Pi scanners.
+  # Pushes site status updates to connected dashboards.
+  # Proxies full scanner connection when operator drills into a site.
+  aggregation:
+    build:
+      context: .
+      dockerfile: Dockerfile.aggregation
+    ports:
+      - "${SCANNER_PORT:-8766}:8766"    # Pi scanners connect here
+      - "${AGG_DASHBOARD_PORT:-8767}:8767"  # Dashboard connects here
+    environment:
+      - AGG_SCANNER_PORT=8766
+      - AGG_DASHBOARD_PORT=8767
+      - AGG_DB_PATH=/var/lib/wifimap/aggregation.db
+    volumes:
+      - wifimap_data:/var/lib/wifimap
+    restart: unless-stopped
+    networks:
+      - wifimap
+
+  # ── Notification bridge ──────────────────────────────────────
+  # Receives security events from scanner and forwards to Ntfy.
+  # Also accepts POSTs from the browser dashboard.
+  notify:
+    build:
+      context: .
+      dockerfile: Dockerfile.notify
+    ports:
+      - "${NOTIFY_PORT:-8768}:8766"
+    environment:
+      - NTFY_HOST=${NTFY_HOST:-localhost}
+      - NTFY_PORT=${NTFY_PORT:-7777}
+      - NTFY_TOPIC=${NTFY_TOPIC:-wifimap-alerts}
+      - BRIDGE_PORT=8766
+      - SCANNER_WS=ws://aggregation:8766
+      - DASHBOARD_URL=${DASHBOARD_URL:-}
+    restart: unless-stopped
+    depends_on:
+      - aggregation
+    networks:
+      - wifimap
+
+volumes:
+  wifimap_data:
+    driver: local
+
+networks:
+  wifimap:
+    driver: bridge
