@@ -40,21 +40,14 @@ jobs:
       - name: Run tests
         run: |
           cd tests
-          python3 -m pytest test_scanner.py test_aggregation.py \
+          PYTHONPATH=../bin python3 -m pytest test_scanner.py test_aggregation.py \
             -v \
             --tb=short \
             -W error::DeprecationWarning \
             --asyncio-mode=auto \
-            --cov=../bin/wifi_scanner --cov=../bin/aggregation_server \
-            --cov-report=term-missing \
-            --cov-report=xml
-
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
-        if: always()
-        with:
-          file: tests/coverage.xml
-          fail_ci_if_error: false
+            --cov=../bin/wifi_scanner \
+            --cov=../bin/aggregation_server \
+            --cov-report=term-missing
 
   lint:
     name: Lint
@@ -74,10 +67,10 @@ jobs:
 
       - name: Check for obvious errors
         run: |
-          python3 -m pyflakes bin/wifi_scanner.py       || true
-          python3 -m pyflakes bin/notification_server.py || true
-          python3 -m pyflakes bin/aggregation_server.py  || true
-          python3 -m pyflakes bin/generate_report.py     || true
+          python3 -m pyflakes bin/wifi_scanner.py        || true
+          python3 -m pyflakes bin/notification_server.py  || true
+          python3 -m pyflakes bin/aggregation_server.py   || true
+          python3 -m pyflakes bin/generate_report.py      || true
 
   package:
     name: Build Package
@@ -102,7 +95,6 @@ jobs:
             Dockerfile.aggregation \
             bin/ \
             web/ \
-            config/ \
             tests/
           echo "Package size: $(du -sh wifimap-v5.3.tar.gz | cut -f1)"
 
