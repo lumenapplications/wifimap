@@ -1,101 +1,88 @@
-# WiFi/MAP v5.3 — Security Platform
+# WiFi/MAP
 
-On-premises WiFi network intelligence and security monitoring for the SMB and MSP market.
-Runs on a Raspberry Pi. No cloud. No subscription.
+![CI](https://github.com/lumenapplications/wifimap/actions/workflows/ci.yml/badge.svg)
 
-![CI](https://github.com/YOUR_ORG/wifimap/actions/workflows/ci.yml/badge.svg)
+On-premises WiFi security monitoring for small businesses and the IT providers who look after them. A Raspberry Pi node sits on the client's network, watches every device and access point in real time, and draws it all on a live floor plan. No cloud, no per-device licensing.
 
-## What's new in v5.3
+<!-- Add a dashboard screenshot here: ![WiFi/MAP dashboard](docs/dashboard.png) -->
 
-**Multi-site MSP dashboard** — central aggregation server with real-time push.
-Pi scanners at client sites connect outbound via Tailscale. MSP overview shows
-all sites, alert counts, and device counts in one view. Click any site to drill in.
+## The problem
 
-**Tailscale integration** — install.sh now installs Tailscale silently.
-Three-command client site deployment: install, tailscale up, done.
+Most small offices can't tell you what's on their own network. A rogue access point in a conference room, a spoofed MAC address on the guest WiFi, or a device that shows up at 2am all go unnoticed until something breaks. Enterprise tools that catch this are priced and built for enterprises. The managed service providers (MSPs) who support these offices need something they can drop into a site in minutes and watch from one screen.
 
-**Docker deployment** — dashboard + notification server + aggregation server
-all containerised. `docker-compose up` on any Linux machine.
+## Who it's for
 
-**PDF security reports** — generate branded PDF reports from any JSON export.
-Device inventory, event log, zone violations, anomaly scores, recommendations.
+Small, owner-operated MSPs managing roughly 10 to 30 client sites. Each site gets a **WiFi/MAP Node**: a branded appliance with a Raspberry Pi, a UPS and an external antenna. Nodes are leased rather than sold, with pricing quoted per site after a free assessment. Returning the node on cancellation doubles as the off switch.
 
-**Deauth detection** — tx_retries delta monitoring via `iw station dump`.
-No monitor mode required.
+## What it does
 
-**Structured exception types** — `ScannerError`, `NetworkError`, `PermissionError`,
-`ParseError`, `ConfigError`. 11 bare excepts replaced with typed catches.
+- **Live floor plan.** Draw the building, place nodes, and see devices and signal coverage as a heatmap that updates in real time.
+- **Security detection.** Flags rogue access points, deauthentication attacks, MAC spoofing and devices entering restricted zones, then scores each device for anomalous behavior.
+- **Persistent history.** Devices, events, known access points and approvals are stored in SQLite, so nothing resets when the node reboots.
+- **Multi-site view for MSPs.** An aggregation server collects every client site over Tailscale. One dashboard shows alert and device counts across all sites, and you can click into any one.
+- **Push alerts.** Notifications go to the operator's phone through Ntfy.
+- **Client-ready reports.** Generates a branded five-page PDF covering the device inventory, event log, zone violations, anomaly scores and recommendations.
 
-## Quick Start (single site)
+## How it's built
+
+| Piece | What it is |
+|---|---|
+| `bin/wifi_scanner.py` | Python scanner that runs on each Pi as a systemd service and streams over WebSockets |
+| `bin/aggregation_server.py` | Central MSP hub with a SQLite site registry, real-time push, drill-in proxy and a watchdog |
+| `bin/notification_server.py` | Bridge from the dashboard to Ntfy push notifications |
+| `bin/generate_report.py` | PDF report generator (WeasyPrint) |
+| `web/index.html` | Single-file dashboard with no build step |
+| `install.sh` | Role-aware installer for a main server or a sensor node, with Tailscale setup |
+| `docker-compose.yml` | Containerized dashboard, notification and aggregation services |
+
+**Quality:** 174 automated tests (155 scanner, 19 aggregation integration), run on every push through GitHub Actions. Errors use typed exceptions (`ScannerError`, `NetworkError`, `ParseError` and others) instead of bare catches.
+
+## Quick start (single site)
 
 ```bash
 scp wifimap-v5.3.tar.gz pi@192.168.1.x:~/
 ssh pi@192.168.1.x
 tar -xzf wifimap-v5.3.tar.gz && cd wifimap
 sudo ./install.sh
-# Then optionally:
-sudo tailscale up
+sudo tailscale up   # optional, for remote access
 ```
 
-## MSP / Multi-site Setup
+## Multi-site setup
 
 ```bash
-# 1. Deploy aggregation server (any Linux machine on Tailscale)
+# 1. Start the aggregation server on any Linux machine on your Tailscale network
 docker-compose up -d
-
-# 2. Get aggregation server Tailscale IP
 tailscale ip -4
 
-# 3. At each client site Pi, edit config and restart
+# 2. On each client-site Pi, point the scanner at it and restart
 sudo nano /etc/wifimap/config.env
-# Set: WIFIMAP_UPSTREAM=ws://100.64.0.2:8766
+#    WIFIMAP_UPSTREAM=ws://<aggregation-ip>:8766
 sudo systemctl restart wifimap-scanner
 
-# 4. Open dashboard → ⊞ MSP View → all sites appear automatically
+# 3. Open the dashboard and switch to MSP View
 ```
 
-## Generate PDF Report
+## Generate a report
 
 ```bash
-# From the dashboard: Export PDF Report → saves JSON
-python3 bin/generate_report.py export.json \
-  --site "Client Name" \
-  --period "April 2026"
+python3 bin/generate_report.py export.json --site "Client Name" --period "April 2026"
 ```
 
-## File Layout
-
-```
-bin/
-  wifi_scanner.py        Pi scanner (systemd, needs WiFi hardware)
-  notification_server.py Ntfy push bridge
-  aggregation_server.py  MSP central hub
-  generate_report.py     PDF report generator
-web/
-  index.html             Dashboard (single-file)
-tests/
-  test_scanner.py        155 tests
-.github/workflows/
-  ci.yml                 GitHub Actions: test + lint + package
-Dockerfile.dashboard
-Dockerfile.notify
-Dockerfile.aggregation
-docker-compose.yml
-install.sh
-```
-
-## Services
+## Run the tests
 
 ```bash
-sudo systemctl status wifimap-scanner
-sudo systemctl status wifimap-web
-sudo systemctl status wifimap-notify
-tail -f /var/log/wifimap/scanner.log
+pip3 install "websockets==12.0" "requests==2.31.0" pytest pytest-asyncio
+cd tests
+PYTHONPATH=../bin python3 -m pytest test_scanner.py test_aggregation.py -v --asyncio-mode=auto -W error::DeprecationWarning
 ```
 
-## Tests
+## Roadmap
 
-```bash
-pip3 install pytest pytest-cov --break-system-packages
-cd /opt/wifimap && pytest tests/ -v -W error::DeprecationWarning
-```
+- Replace the Pi-hole dependency with a four-stage hostname resolution chain
+- Passive DNS monitoring through packet capture
+- Anomaly scores that decay over time instead of only accumulating
+- A building setup wizard with a rescalable grid
+
+---
+
+Built by [Lumen Applications](https://github.com/lumenapplications).
